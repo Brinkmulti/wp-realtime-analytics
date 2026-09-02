@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 4.3.1
+ * Version: 4.3.2
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
