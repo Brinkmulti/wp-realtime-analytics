@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.0.0
+ * Version: 5.0.1
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.0.0');
+define('WPA_PLUGIN_VERSION', '5.0.1');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -1149,7 +1149,7 @@ function wpa_render_tab_overzicht($wpdb, $table) {
         </form>
     </div>
 
-    <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:16px;margin-bottom:20px;">
+    <div class="wpa-grid-4" style="margin-bottom:20px;">
         <div class="wpa-panel"><h3>Live bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html($live_visitors); ?></p></div>
         <div class="wpa-panel"><h3>Weergaven</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($total_views)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($total_views, $prev_views); ?></div>
         <div class="wpa-panel"><h3>Unieke bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p></div>
@@ -1167,10 +1167,14 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     </div>
     <?php endif; ?>
 
-    <div class="wpa-panel" style="margin-bottom:20px;"><canvas id="wpaChart" height="80"></canvas></div>
-    <div class="wpa-panel" style="margin-bottom:20px;"><canvas id="wpaHourChart" height="60"></canvas></div>
+    <div class="wpa-panel" style="margin-bottom:20px;">
+        <div style="position:relative;height:280px;"><canvas id="wpaChart"></canvas></div>
+    </div>
+    <div class="wpa-panel" style="margin-bottom:20px;">
+        <div style="position:relative;height:220px;"><canvas id="wpaHourChart"></canvas></div>
+    </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div class="wpa-grid-2">
         <div class="wpa-panel">
             <h3>Top pagina's</h3>
             <table class="widefat"><tbody>
@@ -1191,7 +1195,9 @@ function wpa_render_tab_overzicht($wpdb, $table) {
 
     <div class="wpa-panel" style="margin-top:16px;">
         <h3>Apparaten</h3>
-        <canvas id="wpaDeviceChart" height="70"></canvas>
+        <div style="position:relative;height:260px;max-width:400px;margin:0 auto;">
+            <canvas id="wpaDeviceChart"></canvas>
+        </div>
     </div>
 
     <?php
@@ -1343,7 +1349,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
         }
     }
     ?>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
             <h3>Kanaal-groepering (30 dagen)</h3>
             <table class="widefat"><tbody>
@@ -1367,7 +1373,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
         </tbody></table>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
             <h3>404-fouten</h3>
             <table class="widefat"><tbody>
@@ -1402,7 +1408,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
         <?php endif; ?>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
             <h3>Formulierveld-uitval</h3>
             <?php if (empty($form_exits)): ?><p style="color:#666;">Nog geen data. Zet dit aan bij Instellingen.</p><?php endif; ?>
@@ -1423,7 +1429,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
         </div>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+    <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
             <h3>A/B-varianten</h3>
             <?php if (empty($ab_variants)): ?><p style="color:#666;">Geen data. Voeg <code>data-wpa-variant="..."</code> toe aan elementen om te testen.</p><?php endif; ?>
@@ -1613,7 +1619,7 @@ function wpa_render_tab_instellingen($can_manage) {
     <div class="wpa-panel">
         <h2>UTM-linkbuilder</h2>
         <p><label>Basis-URL:</label><br><input type="text" id="wpa-utm-base" style="width:100%;" placeholder="https://voorbeeld.nl/pagina"></p>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));gap:8px;">
             <p><label>Source:</label><br><input type="text" id="wpa-utm-source" placeholder="newsletter"></p>
             <p><label>Medium:</label><br><input type="text" id="wpa-utm-medium" placeholder="email"></p>
             <p><label>Campaign:</label><br><input type="text" id="wpa-utm-campaign" placeholder="zomerpromo"></p>
@@ -1661,7 +1667,7 @@ function wpa_render_tab_systeem($wpdb, $table) {
     ?>
     <div class="wpa-panel" style="margin-bottom:20px;">
         <h2>Gezondheidscheck</h2>
-        <div style="display:grid;grid-template-columns:repeat(4, 1fr);gap:16px;">
+        <div class="wpa-grid-4">
             <div><p style="font-size:12px;color:#888;margin:0;">Volgende opschoning</p><p style="font-weight:600;"><?php echo $last_cron ? esc_html(date_i18n('d-m-Y H:i', $last_cron)) : 'Niet gepland'; ?></p></div>
             <div><p style="font-size:12px;color:#888;margin:0;">Tabelgrootte</p><p style="font-weight:600;"><?php echo esc_html($size_row->size_mb ?? '?'); ?> MB (<?php echo esc_html(number_format_i18n($size_row->row_count ?? 0)); ?> rijen, indicatief)</p></div>
             <div><p style="font-size:12px;color:#888;margin:0;">REST-endpoint</p><p style="font-weight:600;color:<?php echo $rest_check === 'ok' ? '#4caf50' : '#f44336'; ?>;"><?php echo $rest_check === 'ok' ? '✔ Bereikbaar' : '✘ Probleem'; ?></p></div>
@@ -1703,6 +1709,10 @@ function wpa_admin_inline_style() {
     <style>
         .wpa-panel { background:#fff; border:1px solid #ccd0d4; border-radius:4px; padding:16px 20px; }
         .wpa-panel h2, .wpa-panel h3 { margin-top:0; }
+        .toplevel_page_brink-analytics .wrap,
+        .toplevel_page_brink-analytics-network .wrap { max-width:1300px; }
+        .wpa-grid-4 { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:16px; }
+        .wpa-grid-2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px; }
     </style>
     <?php
 }
