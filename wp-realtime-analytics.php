@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 4.3.2
+ * Version: 4.4.0
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) exit;
 define('WPA_TABLE_STATS', 'brink_analytics_stats');
 define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_DB_VERSION', '4.3.0'); // ophogen bij elke wijziging aan het tabel-schema
-define('WPA_PLUGIN_VERSION', '4.3.0');
+define('WPA_PLUGIN_VERSION', '4.4.0');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -123,12 +123,33 @@ function wpa_activate_plugin() {
     if (!wp_next_scheduled('wpa_weekly_email_event')) {
         wp_schedule_event(time(), 'weekly', 'wpa_weekly_email_event');
     }
+
+    // Eigen capability voor dashboard-inzage, los van volledige 'manage_options'
+    // rechten. Standaard krijgt alleen Administrator deze; via de instellingen
+    // kan de eigenaar dit ook aan bijv. Redacteur toekennen zonder die rol
+    // meteen volledige adminrechten te geven.
+    $admin_role = get_role('administrator');
+    if ($admin_role && !$admin_role->has_cap('view_brink_analytics')) {
+        $admin_role->add_cap('view_brink_analytics');
+    }
 }
 
 register_deactivation_hook(__FILE__, 'wpa_deactivate_plugin');
 function wpa_deactivate_plugin() {
     wp_clear_scheduled_hook('wpa_weekly_email_event');
     wp_clear_scheduled_hook('wpa_daily_cleanup_event');
+}
+
+register_uninstall_hook(__FILE__, 'wpa_uninstall_plugin');
+function wpa_uninstall_plugin() {
+    // Verwijder de custom capability weer van alle rollen, anders blijft die
+    // achter in de database nadat de plugin allang verwijderd is.
+    foreach (wp_roles()->roles as $role_slug => $role_info) {
+        $role_obj = get_role($role_slug);
+        if ($role_obj && $role_obj->has_cap('view_brink_analytics')) {
+            $role_obj->remove_cap('view_brink_analytics');
+        }
+    }
 }
 
 function wpa_create_tables() {
@@ -230,6 +251,14 @@ function wpa_rest_track_visit($request) {
 
     $ip = isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '127.0.0.1';
 
+    // Defense-in-depth: ook hier de handmatig uitgesloten IP's controleren, voor
+    // het geval een paginacache het tracking-script al had uitgeleverd vóórdat
+    // dit IP aan de uitsluitlijst werd toegevoegd.
+    $exclude_ips = get_option('wpa_exclude_ips', array());
+    if (!empty($exclude_ips) && in_array($ip, $exclude_ips, true)) {
+        return new WP_REST_Response(array('success' => false, 'reason' => 'excluded_ip'), 200);
+    }
+
     // Cloudflare of algemene Country header (Feature 16)
     $country = isset($_SERVER['HTTP_CF_IPCOUNTRY']) ? sanitize_text_field($_SERVER['HTTP_CF_IPCOUNTRY']) : 'Unknown';
 
@@ -309,6 +338,33 @@ function wpa_rest_track_visit($request) {
 add_action('wp_footer', 'wpa_insert_tracking_script');
 function wpa_insert_tracking_script() {
     if (current_user_can('manage_options') || is_admin()) return;
+
+    // Rollen uitsluiten die de beheerder heeft aangevinkt (bv. eigen redacteuren)
+    if (is_user_logged_in()) {
+        $exclude_roles = get_option('wpa_exclude_roles', array());
+        if (!empty($exclude_roles)) {
+            $current_user = wp_get_current_user();
+            if (array_intersect($exclude_roles, (array) $current_user->roles)) {
+                return;
+            }
+        }
+    }
+
+    // Handmatig uitgesloten IP-adressen (bv. kantoor-IP van de klant)
+    $exclude_ips = get_option('wpa_exclude_ips', array());
+    if (!empty($exclude_ips) && isset($_SERVER['REMOTE_ADDR'])) {
+        if (in_array(sanitize_text_field($_SERVER['REMOTE_ADDR']), $exclude_ips, true)) {
+            return;
+        }
+    }
+
+    // Ontwikkelaars-hook: laat een cookie-consent/CMP-plugin bepalen of tracking
+    // mag draaien, bv.: add_filter('wpa_should_track', function($allowed) {
+    //     return function_exists('cookie_consent_given') && cookie_consent_given('statistics');
+    // });
+    if (!apply_filters('wpa_should_track', true)) {
+        return;
+    }
     $api_url = esc_url_raw(rest_url('brink-analytics/v1/track'));
     ?>
     <script>
@@ -482,7 +538,7 @@ function wpa_run_daily_cleanup() {
 
 add_action('admin_menu', 'wpa_add_admin_menu');
 function wpa_add_admin_menu() {
-    $hook = add_menu_page('Brink Analytics', 'Brink Analytics', 'manage_options', 'brink-analytics', 'wpa_render_dashboard', 'dashicons-chart-area', 2);
+    $hook = add_menu_page('Brink Analytics', 'Brink Analytics', 'view_brink_analytics', 'brink-analytics', 'wpa_render_dashboard', 'dashicons-chart-area', 2);
     add_action('load-' . $hook, function () {
         add_action('admin_enqueue_scripts', 'wpa_enqueue_dashboard_assets');
     });
@@ -514,13 +570,13 @@ function wpa_get_trend_html($current, $prev) {
 }
 
 function wpa_render_dashboard() {
-    if (!current_user_can('manage_options')) {
+    if (!current_user_can('view_brink_analytics')) {
         wp_die(esc_html__('Je hebt geen toestemming om deze pagina te bekijken.', 'brink-analytics'));
     }
     global $wpdb;
     $table = $wpdb->prefix . WPA_TABLE_STATS;
     
-    // Instellingen opslaan (Goal URL & Email)
+    // Instellingen opslaan (Goal URL, Email, privacy-uitsluitingen & toegang)
     if (isset($_POST['wpa_save_settings'])) {
         if (
             !isset($_POST['wpa_settings_nonce']) ||
@@ -531,11 +587,48 @@ function wpa_render_dashboard() {
         }
         update_option('wpa_goal_url', sanitize_text_field(wp_unslash($_POST['wpa_goal_url'])));
         update_option('wpa_report_email', sanitize_email(wp_unslash($_POST['wpa_report_email'])));
+
+        // Rollen uitsluiten van tracking (bv. redacteuren die de site testen)
+        $valid_roles = array_keys(wp_roles()->roles);
+        $posted_exclude_roles = isset($_POST['wpa_exclude_roles']) && is_array($_POST['wpa_exclude_roles'])
+            ? array_map('sanitize_key', wp_unslash($_POST['wpa_exclude_roles']))
+            : array();
+        update_option('wpa_exclude_roles', array_values(array_intersect($posted_exclude_roles, $valid_roles)));
+
+        // IP-adressen uitsluiten van tracking, één per regel
+        $raw_ips = isset($_POST['wpa_exclude_ips']) ? sanitize_textarea_field(wp_unslash($_POST['wpa_exclude_ips'])) : '';
+        $ip_lines = array_filter(array_map('trim', explode("\n", $raw_ips)));
+        $clean_ips = array_values(array_filter($ip_lines, function ($ip) {
+            return filter_var($ip, FILTER_VALIDATE_IP) !== false;
+        }));
+        update_option('wpa_exclude_ips', $clean_ips);
+
+        // Rollen die (naast Administrator) het dashboard mogen bekijken
+        $posted_dashboard_roles = isset($_POST['wpa_dashboard_roles']) && is_array($_POST['wpa_dashboard_roles'])
+            ? array_map('sanitize_key', wp_unslash($_POST['wpa_dashboard_roles']))
+            : array();
+        $posted_dashboard_roles = array_values(array_intersect($posted_dashboard_roles, $valid_roles));
+        foreach (wp_roles()->roles as $role_slug => $role_info) {
+            if ($role_slug === 'administrator') continue; // Administrator behoudt de cap altijd
+            $role_obj = get_role($role_slug);
+            if (!$role_obj) continue;
+            if (in_array($role_slug, $posted_dashboard_roles, true)) {
+                $role_obj->add_cap('view_brink_analytics');
+            } else {
+                $role_obj->remove_cap('view_brink_analytics');
+            }
+        }
+        update_option('wpa_dashboard_roles', $posted_dashboard_roles);
+
         echo '<div class="updated"><p>Instellingen opgeslagen.</p></div>';
     }
 
     $goal_url = get_option('wpa_goal_url', '/bedankt');
     $report_email = get_option('wpa_report_email', get_option('admin_email'));
+    $exclude_roles = get_option('wpa_exclude_roles', array());
+    $exclude_ips = get_option('wpa_exclude_ips', array());
+    $dashboard_roles = get_option('wpa_dashboard_roles', array());
+    $editable_roles = wp_roles()->roles;
 
     // Filters verwerken (Inclusief Custom Date)
     $range = isset($_GET['range']) ? sanitize_text_field($_GET['range']) : '30';
@@ -978,6 +1071,37 @@ function wpa_render_dashboard() {
                             <label><strong>Ontvang wekelijkse samenvatting (E-mail):</strong></label><br>
                             <input type="email" name="wpa_report_email" value="<?php echo esc_attr($report_email); ?>" style="width:100%; margin-top:5px;">
                         </p>
+
+                        <hr style="margin:20px 0;">
+                        <h3 style="margin-top:0;">Privacy: uitsluiten van tracking</h3>
+                        <p>
+                            <label><strong>Rollen uitsluiten</strong> (bv. je eigen redacteuren):</label><br>
+                            <?php foreach ($editable_roles as $role_slug => $role_info): ?>
+                                <label style="margin-right:15px; display:inline-block; margin-top:5px;">
+                                    <input type="checkbox" name="wpa_exclude_roles[]" value="<?php echo esc_attr($role_slug); ?>" <?php checked(in_array($role_slug, $exclude_roles, true)); ?>>
+                                    <?php echo esc_html(translate_user_role($role_info['name'])); ?>
+                                </label>
+                            <?php endforeach; ?>
+                            <br><span style="font-size:12px;color:#888;">Beheerders (Administrator) worden altijd al automatisch uitgesloten.</span>
+                        </p>
+                        <p>
+                            <label><strong>IP-adressen uitsluiten</strong> (één per regel):</label><br>
+                            <textarea name="wpa_exclude_ips" rows="3" style="width:100%; margin-top:5px;" placeholder="192.168.1.10&#10;203.0.113.42"><?php echo esc_textarea(implode("\n", $exclude_ips)); ?></textarea>
+                        </p>
+
+                        <hr style="margin:20px 0;">
+                        <h3 style="margin-top:0;">Toegang: wie mag het dashboard bekijken?</h3>
+                        <p>
+                            <?php foreach ($editable_roles as $role_slug => $role_info): ?>
+                                <?php if ($role_slug === 'administrator') continue; ?>
+                                <label style="margin-right:15px; display:inline-block; margin-top:5px;">
+                                    <input type="checkbox" name="wpa_dashboard_roles[]" value="<?php echo esc_attr($role_slug); ?>" <?php checked(in_array($role_slug, $dashboard_roles, true)); ?>>
+                                    <?php echo esc_html(translate_user_role($role_info['name'])); ?>
+                                </label>
+                            <?php endforeach; ?>
+                            <br><span style="font-size:12px;color:#888;">Administrator heeft altijd toegang. Instellingen wijzigen en CSV-export blijven voorbehouden aan Administrator.</span>
+                        </p>
+
                         <button type="submit" name="wpa_save_settings" class="button button-primary">Instellingen Opslaan</button>
                     </form>
                     <hr style="margin:20px 0;">
