@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.0.1
+ * Version: 5.0.2
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.0.1');
+define('WPA_PLUGIN_VERSION', '5.0.2');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -148,6 +148,23 @@ function wpa_get_channel($referrer, $utm_source, $utm_medium) {
         if (strpos($host, $s) !== false) return 'Organisch';
     }
     return 'Referral';
+}
+
+// Zorgt dat bezoeken uit oudere plugin-versies (die het apparaattype soms
+// net iets anders spelden, bv. 'mobile' i.p.v. 'Mobiel') tóch in dezelfde
+// grafiekbalk vallen als nieuwe bezoeken van hetzelfde type.
+function wpa_normalize_device_label($raw) {
+    $raw = strtolower(trim((string) $raw));
+    if (strpos($raw, 'mobile') !== false || strpos($raw, 'mobiel') !== false || strpos($raw, 'telefoon') !== false || strpos($raw, 'phone') !== false) {
+        return 'Mobiel';
+    }
+    if (strpos($raw, 'tablet') !== false || strpos($raw, 'ipad') !== false) {
+        return 'Tablet';
+    }
+    if (strpos($raw, 'desktop') !== false || $raw === '') {
+        return 'Desktop';
+    }
+    return 'Overig';
 }
 
 function wpa_get_trend_html($current, $prev) {
@@ -1113,6 +1130,7 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     $total_views = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE $where AND event_type='pageview'");
     $unique_visitors = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $where AND event_type='pageview'");
     $prev_views = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE $prev_where AND event_type='pageview'");
+    $prev_unique_visitors = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $prev_where AND event_type='pageview'");
 
     $chart_rows = $wpdb->get_results("SELECT DATE(visit_time) as d, COUNT(DISTINCT visitor_hash) as c FROM $table WHERE $where AND event_type='pageview' GROUP BY DATE(visit_time) ORDER BY d ASC");
     $chart_labels = array(); $chart_data = array();
@@ -1129,8 +1147,10 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     // Feature #11: totalen per (mogelijk meerdere) conversiedoel
     $goals = wpa_get_goals();
     $goal_totals = array();
+    $prev_goal_totals = array();
     foreach ($goals as $goal) {
         $goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $where AND page_url LIKE %s", '%' . $wpdb->esc_like($goal->url_pattern) . '%'));
+        $prev_goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $prev_where AND page_url LIKE %s", '%' . $wpdb->esc_like($goal->url_pattern) . '%'));
     }
     ?>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap;">
@@ -1152,8 +1172,8 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     <div class="wpa-grid-4" style="margin-bottom:20px;">
         <div class="wpa-panel"><h3>Live bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html($live_visitors); ?></p></div>
         <div class="wpa-panel"><h3>Weergaven</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($total_views)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($total_views, $prev_views); ?></div>
-        <div class="wpa-panel"><h3>Unieke bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p></div>
-        <div class="wpa-panel"><h3>Doelen behaald</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(array_sum($goal_totals)); ?></p></div>
+        <div class="wpa-panel"><h3>Unieke bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($unique_visitors, $prev_unique_visitors); ?></div>
+        <div class="wpa-panel"><h3>Doelen behaald</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(array_sum($goal_totals)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html(array_sum($goal_totals), array_sum($prev_goal_totals)); ?></div>
     </div>
 
     <?php if (!empty($goal_totals)): ?>
@@ -1201,8 +1221,14 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     </div>
 
     <?php
-    $device_labels = array(); $device_data = array();
-    foreach ($devices as $d) { $device_labels[] = $d->device; $device_data[] = (int) $d->c; }
+    $device_labels = array(); $device_totals = array();
+    foreach ($devices as $d) {
+        $label = wpa_normalize_device_label($d->device);
+        $device_totals[$label] = ($device_totals[$label] ?? 0) + (int) $d->c;
+    }
+    arsort($device_totals);
+    $device_labels = array_keys($device_totals);
+    $device_data = array_values($device_totals);
 
     $inline_js = "
         const ctx = document.getElementById('wpaChart').getContext('2d');
