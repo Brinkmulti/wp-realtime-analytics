@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.0.2
+ * Version: 5.0.3
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.0.2');
+define('WPA_PLUGIN_VERSION', '5.0.3');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -1117,6 +1117,16 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     } elseif ($range === 'all') {
         $where = '1=1';
         $prev_where = '1=0';
+    } elseif ($range === 'today') {
+        $today = current_time('Y-m-d');
+        $yesterday = date('Y-m-d', strtotime($today) - DAY_IN_SECONDS);
+        $where = $wpdb->prepare('visit_time BETWEEN %s AND %s', $today . ' 00:00:00', $today . ' 23:59:59');
+        $prev_where = $wpdb->prepare('visit_time BETWEEN %s AND %s', $yesterday . ' 00:00:00', $yesterday . ' 23:59:59');
+    } elseif ($range === 'yesterday') {
+        $yesterday = date('Y-m-d', strtotime(current_time('Y-m-d')) - DAY_IN_SECONDS);
+        $day_before = date('Y-m-d', strtotime($yesterday) - DAY_IN_SECONDS);
+        $where = $wpdb->prepare('visit_time BETWEEN %s AND %s', $yesterday . ' 00:00:00', $yesterday . ' 23:59:59');
+        $prev_where = $wpdb->prepare('visit_time BETWEEN %s AND %s', $day_before . ' 00:00:00', $day_before . ' 23:59:59');
     } else {
         $days = (int) $range;
         if ($days <= 0) $days = 7;
@@ -1157,6 +1167,8 @@ function wpa_render_tab_overzicht($wpdb, $table) {
         <form method="GET" style="display:flex;gap:8px;align-items:center;">
             <input type="hidden" name="page" value="brink-analytics">
             <select name="range" onchange="this.form.submit()">
+                <option value="today" <?php selected($range, 'today'); ?>>Vandaag</option>
+                <option value="yesterday" <?php selected($range, 'yesterday'); ?>>Gisteren</option>
                 <option value="7" <?php selected($range, '7'); ?>>Laatste 7 dagen</option>
                 <option value="30" <?php selected($range, '30'); ?>>Laatste 30 dagen</option>
                 <option value="90" <?php selected($range, '90'); ?>>Laatste 90 dagen</option>
