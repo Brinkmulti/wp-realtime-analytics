@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.0.3
+ * Version: 5.1.0
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.0.3');
+define('WPA_PLUGIN_VERSION', '5.1.0');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -1077,6 +1077,7 @@ function wpa_render_dashboard() {
         'kanalen' => 'Kanalen & gedrag',
         'privacy' => 'Privacy & toegang',
         'instellingen' => 'Instellingen',
+        'zoekwoorden' => 'Zoekwoorden (GSC)',
         'systeem' => 'Systeem',
     );
     ?>
@@ -1094,6 +1095,7 @@ function wpa_render_dashboard() {
             case 'kanalen': wpa_render_tab_kanalen($wpdb, $table); break;
             case 'privacy': wpa_render_tab_privacy($can_manage); break;
             case 'instellingen': wpa_render_tab_instellingen($can_manage); break;
+            case 'zoekwoorden': wpa_render_tab_zoekwoorden($can_manage); break;
             case 'systeem': wpa_render_tab_systeem($wpdb, $table); break;
             default: wpa_render_tab_overzicht($wpdb, $table); break;
         }
@@ -1137,10 +1139,55 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     $live_time_limit = date('Y-m-d H:i:s', current_time('timestamp') - 300);
     $live_visitors = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE visit_time >= %s AND event_type='pageview'", $live_time_limit));
 
+    // Feature #6: waar de live bezoekers vandaan komen (gebaseerd op de country-data
+    // die al verzameld wordt, bv. via de Cloudflare-header)
+    $live_countries = $wpdb->get_results($wpdb->prepare(
+        "SELECT country, COUNT(DISTINCT visitor_hash) as c FROM $table WHERE visit_time >= %s AND event_type='pageview' GROUP BY country ORDER BY c DESC LIMIT 5",
+        $live_time_limit
+    ));
+
     $total_views = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE $where AND event_type='pageview'");
     $unique_visitors = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $where AND event_type='pageview'");
     $prev_views = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE $prev_where AND event_type='pageview'");
     $prev_unique_visitors = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $prev_where AND event_type='pageview'");
+
+    // Feature #1: bouncepercentage — een "entree"-pageview (is_entrance=1) telt als
+    // bounce wanneer er geen volgende pageview van dezelfde bezoeker binnen 30
+    // minuten is. Er wordt bewust geen apart session_id-veld toegevoegd (blijft
+    // lichtgewicht); dit wordt afgeleid uit de bestaande is_entrance-vlag.
+    $total_sessions = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where");
+    $bounced_sessions = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM $table e
+        WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where
+        AND NOT EXISTS (
+            SELECT 1 FROM $table p
+            WHERE p.visitor_hash = e.visitor_hash AND p.event_type='pageview' AND p.id != e.id
+            AND p.visit_time > e.visit_time AND p.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
+        )
+    ");
+    $bounce_rate = $total_sessions > 0 ? round(($bounced_sessions / $total_sessions) * 100) : null;
+
+    $prev_total_sessions = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND $prev_where");
+    $prev_bounced_sessions = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM $table e
+        WHERE e.event_type='pageview' AND e.is_entrance=1 AND $prev_where
+        AND NOT EXISTS (
+            SELECT 1 FROM $table p
+            WHERE p.visitor_hash = e.visitor_hash AND p.event_type='pageview' AND p.id != e.id
+            AND p.visit_time > e.visit_time AND p.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
+        )
+    ");
+    $prev_bounce_rate = $prev_total_sessions > 0 ? round(($prev_bounced_sessions / $prev_total_sessions) * 100) : null;
+
+    // Feature #1: gemiddelde tijd op site, benaderd per bezoeker per dag (geen
+    // exacte sessieduur, want dat vereist sessie-koppeling die de plugin bewust
+    // niet bijhoudt — zie toelichting bij de kaart zelf)
+    $avg_session_seconds = (float) $wpdb->get_var("
+        SELECT AVG(daily_total) FROM (
+            SELECT visitor_hash, DATE(visit_time) as d, SUM(time_on_page) as daily_total
+            FROM $table WHERE $where AND event_type='engagement' GROUP BY visitor_hash, DATE(visit_time)
+        ) t
+    ");
 
     $chart_rows = $wpdb->get_results("SELECT DATE(visit_time) as d, COUNT(DISTINCT visitor_hash) as c FROM $table WHERE $where AND event_type='pageview' GROUP BY DATE(visit_time) ORDER BY d ASC");
     $chart_labels = array(); $chart_data = array();
@@ -1182,10 +1229,39 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     </div>
 
     <div class="wpa-grid-4" style="margin-bottom:20px;">
-        <div class="wpa-panel"><h3>Live bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html($live_visitors); ?></p></div>
+        <div class="wpa-panel">
+            <h3>Live bezoekers</h3>
+            <p style="font-size:28px;margin:0;"><?php echo esc_html($live_visitors); ?></p>
+            <?php if (!empty($live_countries)): ?>
+                <p style="font-size:12px;color:#888;margin:6px 0 0;">
+                    <?php echo esc_html(implode(' · ', array_map(function ($lc) { return $lc->country . ': ' . $lc->c; }, $live_countries))); ?>
+                </p>
+            <?php endif; ?>
+        </div>
         <div class="wpa-panel"><h3>Weergaven</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($total_views)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($total_views, $prev_views); ?></div>
         <div class="wpa-panel"><h3>Unieke bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($unique_visitors, $prev_unique_visitors); ?></div>
         <div class="wpa-panel"><h3>Doelen behaald</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(array_sum($goal_totals)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html(array_sum($goal_totals), array_sum($prev_goal_totals)); ?></div>
+    </div>
+
+    <div class="wpa-grid-4" style="margin-bottom:20px;">
+        <div class="wpa-panel">
+            <h3>Bouncepercentage</h3>
+            <p style="font-size:28px;margin:0;"><?php echo $bounce_rate !== null ? esc_html($bounce_rate) . '%' : 'N/A'; ?></p>
+            <?php if ($range !== 'all' && $range !== 'custom' && $bounce_rate !== null && $prev_bounce_rate !== null):
+                $bounce_diff = $bounce_rate - $prev_bounce_rate;
+                $bounce_color = $bounce_diff <= 0 ? '#4caf50' : '#f44336'; // dalen is positief
+                $bounce_arrow = $bounce_diff <= 0 ? '▼' : '▲';
+                $bounce_sign = $bounce_diff > 0 ? '+' : '';
+            ?>
+                <span style="font-size:13px;color:<?php echo esc_attr($bounce_color); ?>;font-weight:500;"><?php echo esc_html($bounce_arrow); ?> <?php echo esc_html($bounce_sign . $bounce_diff); ?> procentpunt</span>
+            <?php endif; ?>
+            <p style="font-size:11px;color:#888;margin:6px 0 0;">% bezoeken met maar 1 pagina</p>
+        </div>
+        <div class="wpa-panel">
+            <h3>Gem. tijd op site</h3>
+            <p style="font-size:28px;margin:0;"><?php echo esc_html(gmdate('i:s', (int) round($avg_session_seconds))); ?></p>
+            <p style="font-size:11px;color:#888;margin:6px 0 0;">Benaderd per bezoeker per dag (geen exacte sessiekoppeling)</p>
+        </div>
     </div>
 
     <?php if (!empty($goal_totals)): ?>
@@ -1338,6 +1414,27 @@ function wpa_render_tab_kanalen($wpdb, $table) {
     }
     arsort($channels);
 
+    // Feature #2: trending content — pagina's met de grootste week-op-week groei
+    $this_week_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
+    $prev_week_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY) AND DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
+    $prev_week_map = array();
+    foreach ($prev_week_rows as $pw) { $prev_week_map[$pw->page_url] = (int) $pw->c; }
+    $trending = array();
+    foreach ($this_week_rows as $tw) {
+        $cur = (int) $tw->c;
+        if ($cur < 3) continue; // te weinig volume om iets zinnigs over te zeggen
+        $prev = $prev_week_map[$tw->page_url] ?? 0;
+        $growth = $prev > 0 ? round((($cur - $prev) / $prev) * 100) : null; // null = nieuw deze week
+        $trending[] = array('page_url' => $tw->page_url, 'cur' => $cur, 'prev' => $prev, 'growth' => $growth);
+    }
+    usort($trending, function ($a, $b) {
+        if ($a['growth'] === null && $b['growth'] === null) return $b['cur'] <=> $a['cur'];
+        if ($a['growth'] === null) return -1;
+        if ($b['growth'] === null) return 1;
+        return $b['growth'] <=> $a['growth'];
+    });
+    $trending = array_slice($trending, 0, 10);
+
     // Nieuw vs. terugkerend (Feature #7)
     $new_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM (SELECT visitor_hash FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY) GROUP BY visitor_hash HAVING MIN(visit_time) >= DATE_SUB(NOW(), INTERVAL 30 DAY)) t");
     $total_unique = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
@@ -1387,6 +1484,28 @@ function wpa_render_tab_kanalen($wpdb, $table) {
         }
     }
     ?>
+    <div class="wpa-panel" style="margin-bottom:16px;">
+        <h3>Trending content (grootste groei deze week vs. vorige week)</h3>
+        <?php if (empty($trending)): ?>
+            <p style="color:#666;">Nog niet genoeg data (minimaal 3 weergaven deze week per pagina nodig).</p>
+        <?php else: ?>
+            <table class="widefat"><thead><tr><th>Pagina</th><th>Vorige week</th><th>Deze week</th><th>Groei</th></tr></thead><tbody>
+            <?php foreach ($trending as $t): ?>
+                <tr>
+                    <td><?php echo esc_html($t['page_url']); ?></td>
+                    <td><?php echo esc_html($t['prev']); ?></td>
+                    <td><?php echo esc_html($t['cur']); ?></td>
+                    <td><?php if ($t['growth'] === null): ?>
+                        <span style="color:#378ADD;font-weight:500;">Nieuw</span>
+                    <?php else: ?>
+                        <span style="color:<?php echo $t['growth'] >= 0 ? '#4caf50' : '#f44336'; ?>;font-weight:500;"><?php echo $t['growth'] >= 0 ? '+' : ''; ?><?php echo esc_html($t['growth']); ?>%</span>
+                    <?php endif; ?></td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody></table>
+        <?php endif; ?>
+    </div>
+
     <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
             <h3>Kanaal-groepering (30 dagen)</h3>
@@ -1752,5 +1871,248 @@ function wpa_admin_inline_style() {
         .wpa-grid-4 { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:16px; }
         .wpa-grid-2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px; }
     </style>
+    <?php
+}
+
+// ---------------------------------------------------------------------
+// Feature #9: Google Search Console-koppeling
+// ---------------------------------------------------------------------
+function wpa_gsc_redirect_uri() {
+    return admin_url('admin.php?page=brink-analytics&tab=zoekwoorden');
+}
+
+add_action('admin_init', 'wpa_handle_gsc_oauth_callback');
+function wpa_handle_gsc_oauth_callback() {
+    if (!isset($_GET['page']) || $_GET['page'] !== 'brink-analytics' || !isset($_GET['tab']) || $_GET['tab'] !== 'zoekwoorden') return;
+    if (!current_user_can('manage_options')) return;
+
+    // Loskoppelen
+    if (isset($_GET['wpa_gsc_disconnect']) && isset($_GET['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['_wpnonce'])), 'wpa_gsc_disconnect')) {
+        delete_option('wpa_gsc_access_token');
+        delete_option('wpa_gsc_refresh_token');
+        delete_option('wpa_gsc_token_expires');
+        wp_safe_redirect(wpa_gsc_redirect_uri());
+        exit;
+    }
+
+    // OAuth-callback van Google
+    if (!isset($_GET['code']) || !isset($_GET['state'])) return;
+    if (!wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['state'])), 'wpa_gsc_oauth')) return;
+
+    $client_id = get_option('wpa_gsc_client_id', '');
+    $client_secret = get_option('wpa_gsc_client_secret', '');
+    if (empty($client_id) || empty($client_secret)) return;
+
+    $response = wp_remote_post('https://oauth2.googleapis.com/token', array(
+        'timeout' => 10,
+        'body' => array(
+            'code' => sanitize_text_field(wp_unslash($_GET['code'])),
+            'client_id' => $client_id,
+            'client_secret' => $client_secret,
+            'redirect_uri' => wpa_gsc_redirect_uri(),
+            'grant_type' => 'authorization_code',
+        ),
+    ));
+
+    if (is_wp_error($response)) {
+        wpa_debug_log('GSC token exchange mislukt: ' . $response->get_error_message());
+        return;
+    }
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+    if (!empty($data['access_token'])) {
+        update_option('wpa_gsc_access_token', $data['access_token']);
+        if (!empty($data['refresh_token'])) {
+            update_option('wpa_gsc_refresh_token', $data['refresh_token']);
+        }
+        update_option('wpa_gsc_token_expires', time() + (int) ($data['expires_in'] ?? 3600));
+        wp_safe_redirect(wpa_gsc_redirect_uri());
+        exit;
+    } else {
+        wpa_debug_log('GSC token exchange gaf geen access_token terug: ' . wp_remote_retrieve_body($response));
+    }
+}
+
+function wpa_gsc_get_valid_access_token() {
+    $client_id = get_option('wpa_gsc_client_id', '');
+    $client_secret = get_option('wpa_gsc_client_secret', '');
+    $access_token = get_option('wpa_gsc_access_token', '');
+    $refresh_token = get_option('wpa_gsc_refresh_token', '');
+    $expires = (int) get_option('wpa_gsc_token_expires', 0);
+
+    if (empty($access_token) || empty($refresh_token)) return false;
+
+    if (time() < ($expires - 60)) {
+        return $access_token;
+    }
+
+    // Ververs het token
+    $response = wp_remote_post('https://oauth2.googleapis.com/token', array(
+        'timeout' => 10,
+        'body' => array(
+            'client_id' => $client_id,
+            'client_secret' => $client_secret,
+            'refresh_token' => $refresh_token,
+            'grant_type' => 'refresh_token',
+        ),
+    ));
+
+    if (is_wp_error($response)) {
+        wpa_debug_log('GSC token-refresh mislukt: ' . $response->get_error_message());
+        return false;
+    }
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+    if (empty($data['access_token'])) {
+        wpa_debug_log('GSC token-refresh gaf geen access_token terug: ' . wp_remote_retrieve_body($response));
+        return false;
+    }
+
+    update_option('wpa_gsc_access_token', $data['access_token']);
+    update_option('wpa_gsc_token_expires', time() + (int) ($data['expires_in'] ?? 3600));
+    return $data['access_token'];
+}
+
+function wpa_gsc_fetch_search_analytics($dimension, $days = 28) {
+    $cache_key = 'wpa_gsc_' . $dimension . '_' . $days;
+    $cached = get_transient($cache_key);
+    if (false !== $cached) return $cached;
+
+    $token = wpa_gsc_get_valid_access_token();
+    $site_url = get_option('wpa_gsc_site_url', home_url('/'));
+    if (!$token || empty($site_url)) return false;
+
+    $endpoint = 'https://www.googleapis.com/webmasters/v3/sites/' . rawurlencode($site_url) . '/searchAnalytics/query';
+    $response = wp_remote_post($endpoint, array(
+        'timeout' => 15,
+        'headers' => array(
+            'Authorization' => 'Bearer ' . $token,
+            'Content-Type' => 'application/json',
+        ),
+        'body' => wp_json_encode(array(
+            'startDate' => date('Y-m-d', strtotime("-{$days} days")),
+            'endDate' => date('Y-m-d', strtotime('-2 days')), // GSC-data heeft doorgaans 1-2 dagen vertraging
+            'dimensions' => array($dimension),
+            'rowLimit' => 20,
+        )),
+    ));
+
+    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+        wpa_debug_log('GSC data ophalen mislukt (' . $dimension . '): ' . (is_wp_error($response) ? $response->get_error_message() : wp_remote_retrieve_body($response)));
+        return false;
+    }
+
+    $data = json_decode(wp_remote_retrieve_body($response), true);
+    $rows = $data['rows'] ?? array();
+    set_transient($cache_key, $rows, 6 * HOUR_IN_SECONDS);
+    return $rows;
+}
+
+function wpa_render_tab_zoekwoorden($can_manage) {
+    if ($can_manage && isset($_POST['wpa_save_gsc']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['wpa_gsc_nonce'] ?? '')), 'wpa_save_gsc_action')) {
+        update_option('wpa_gsc_client_id', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_id'] ?? '')));
+        update_option('wpa_gsc_client_secret', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_secret'] ?? '')));
+        update_option('wpa_gsc_site_url', esc_url_raw(wp_unslash($_POST['wpa_gsc_site_url'] ?? home_url('/'))));
+        echo '<div class="updated"><p>Search Console-instellingen opgeslagen.</p></div>';
+    }
+
+    $client_id = get_option('wpa_gsc_client_id', '');
+    $client_secret = get_option('wpa_gsc_client_secret', '');
+    $site_url = get_option('wpa_gsc_site_url', home_url('/'));
+    $is_connected = (bool) get_option('wpa_gsc_refresh_token', '');
+    $redirect_uri = wpa_gsc_redirect_uri();
+    ?>
+    <div class="wpa-panel" style="margin-bottom:20px;">
+        <h2>Google Search Console koppelen</h2>
+        <p style="color:#666;">Toont zoekwoorden en pagina's uit Google Search Console naast je eigen bezoekersdata. Hiervoor is een eigen OAuth-app in de Google Cloud Console nodig (gratis, maar wel een eenmalige instap):</p>
+        <ol style="margin-left:20px;list-style:decimal;">
+            <li>Maak een project aan in de <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a> en schakel de "Search Console API" in.</li>
+            <li>Maak OAuth-clientgegevens aan (type: "Webtoepassing").</li>
+            <li>Voeg als geautoriseerde redirect-URI toe: <code><?php echo esc_html($redirect_uri); ?></code></li>
+            <li>Plak de Client ID en Client Secret hieronder.</li>
+        </ol>
+
+        <?php if ($can_manage): ?>
+        <form method="POST">
+            <?php wp_nonce_field('wpa_save_gsc_action', 'wpa_gsc_nonce'); ?>
+            <p><label><strong>Client ID:</strong></label><br><input type="text" name="wpa_gsc_client_id" value="<?php echo esc_attr($client_id); ?>" style="width:100%;"></p>
+            <p><label><strong>Client Secret:</strong></label><br><input type="password" name="wpa_gsc_client_secret" value="<?php echo esc_attr($client_secret); ?>" style="width:100%;" autocomplete="new-password"></p>
+            <p><label><strong>Site-URL zoals geregistreerd in Search Console:</strong></label><br><input type="text" name="wpa_gsc_site_url" value="<?php echo esc_attr($site_url); ?>" style="width:100%;" placeholder="<?php echo esc_attr(home_url('/')); ?>"></p>
+            <button type="submit" name="wpa_save_gsc" class="button button-primary">Opslaan</button>
+        </form>
+        <?php endif; ?>
+
+        <?php if ($client_id && $client_secret): ?>
+            <hr style="margin:20px 0;">
+            <?php if ($is_connected): ?>
+                <p><span style="color:#4caf50;font-weight:600;">✔ Verbonden</span> met Search Console.</p>
+                <?php if ($can_manage): ?>
+                <a href="<?php echo esc_url(wp_nonce_url(add_query_arg('wpa_gsc_disconnect', 1, $redirect_uri), 'wpa_gsc_disconnect')); ?>" class="button">Loskoppelen</a>
+                <?php endif; ?>
+            <?php elseif ($can_manage): ?>
+                <?php
+                $auth_url = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query(array(
+                    'client_id' => $client_id,
+                    'redirect_uri' => $redirect_uri,
+                    'response_type' => 'code',
+                    'scope' => 'https://www.googleapis.com/auth/webmasters.readonly',
+                    'access_type' => 'offline',
+                    'prompt' => 'consent',
+                    'state' => wp_create_nonce('wpa_gsc_oauth'),
+                ));
+                ?>
+                <a href="<?php echo esc_url($auth_url); ?>" class="button button-primary">Verbinden met Google Search Console</a>
+            <?php endif; ?>
+        <?php endif; ?>
+    </div>
+
+    <?php if ($is_connected):
+        $queries = wpa_gsc_fetch_search_analytics('query', 28);
+        $pages = wpa_gsc_fetch_search_analytics('page', 28);
+    ?>
+    <div class="wpa-grid-2">
+        <div class="wpa-panel">
+            <h3>Top zoekwoorden (28 dagen, org. zoekresultaten)</h3>
+            <?php if ($queries === false): ?>
+                <p style="color:#f44336;">Kon geen data ophalen. Controleer of de Site-URL exact overeenkomt met Search Console en of de API is ingeschakeld.</p>
+            <?php elseif (empty($queries)): ?>
+                <p style="color:#666;">Nog geen data beschikbaar.</p>
+            <?php else: ?>
+                <table class="widefat"><thead><tr><th>Zoekwoord</th><th>Klikken</th><th>Vertoningen</th><th>CTR</th><th>Positie</th></tr></thead><tbody>
+                <?php foreach ($queries as $q): ?>
+                    <tr>
+                        <td><?php echo esc_html($q['keys'][0] ?? ''); ?></td>
+                        <td><?php echo esc_html($q['clicks'] ?? 0); ?></td>
+                        <td><?php echo esc_html($q['impressions'] ?? 0); ?></td>
+                        <td><?php echo esc_html(round(($q['ctr'] ?? 0) * 100, 1)); ?>%</td>
+                        <td><?php echo esc_html(round($q['position'] ?? 0, 1)); ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody></table>
+            <?php endif; ?>
+        </div>
+        <div class="wpa-panel">
+            <h3>Top pagina's in zoekresultaten (28 dagen)</h3>
+            <?php if ($pages === false): ?>
+                <p style="color:#f44336;">Kon geen data ophalen.</p>
+            <?php elseif (empty($pages)): ?>
+                <p style="color:#666;">Nog geen data beschikbaar.</p>
+            <?php else: ?>
+                <table class="widefat"><thead><tr><th>Pagina</th><th>Klikken</th><th>Vertoningen</th><th>CTR</th><th>Positie</th></tr></thead><tbody>
+                <?php foreach ($pages as $p): ?>
+                    <tr>
+                        <td><?php echo esc_html($p['keys'][0] ?? ''); ?></td>
+                        <td><?php echo esc_html($p['clicks'] ?? 0); ?></td>
+                        <td><?php echo esc_html($p['impressions'] ?? 0); ?></td>
+                        <td><?php echo esc_html(round(($p['ctr'] ?? 0) * 100, 1)); ?>%</td>
+                        <td><?php echo esc_html(round($p['position'] ?? 0, 1)); ?></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody></table>
+            <?php endif; ?>
+        </div>
+    </div>
+    <p style="font-size:12px;color:#888;margin-top:10px;">Gegevens worden 6 uur gecachet en hebben, zoals gebruikelijk bij Search Console, doorgaans 1-2 dagen vertraging.</p>
+    <?php endif; ?>
     <?php
 }
