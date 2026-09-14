@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.1.0
+ * Version: 5.2.0
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.1.0');
+define('WPA_PLUGIN_VERSION', '5.2.0');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -772,6 +772,28 @@ function wpa_render_network_dashboard() {
 // Cronjobs: rapportage, opschoning, afwijkingsdetectie
 // ---------------------------------------------------------------------
 add_action('wpa_weekly_email_event', 'wpa_send_weekly_email');
+// Herbruikbare bouncepercentage-berekening (Feature #1 / #5), zodat dezelfde
+// logica niet los in het dashboard, de e-mail én het per-pagina-rapport staat.
+function wpa_calc_bounce_rate($wpdb, $table, $where_clause) {
+    $total = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where_clause");
+    if ($total === 0) return null;
+    $bounced = (int) $wpdb->get_var("
+        SELECT COUNT(*) FROM $table e
+        WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where_clause
+        AND NOT EXISTS (
+            SELECT 1 FROM $table p
+            WHERE p.visitor_hash = e.visitor_hash AND p.event_type='pageview' AND p.id != e.id
+            AND p.visit_time > e.visit_time AND p.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
+        )
+    ");
+    return round(($bounced / $total) * 100);
+}
+
+// Feature #20: korte uitlegtooltip naast een metric-titel
+function wpa_tooltip($text) {
+    return ' <span title="' . esc_attr($text) . '" style="cursor:help;color:#888;font-size:11px;border:1px solid #ccc;border-radius:50%;padding:0 5px;display:inline-block;">?</span>';
+}
+
 function wpa_send_weekly_email() {
     // Feature #28: e-mailfrequentie instelbaar; deze cron is de vaste "klok",
     // maar we versturen alleen daadwerkelijk als de frequentie dat toestaat.
@@ -795,6 +817,47 @@ function wpa_send_weekly_email() {
     if ($top_page) {
         $body .= "- Meest bezochte pagina: " . $top_page . "\n";
     }
+
+    // Feature #2: automatisch gegenereerde highlights
+    $highlights = array();
+
+    $bounce_this_week = wpa_calc_bounce_rate($wpdb, $table, "visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)");
+    $bounce_last_week = wpa_calc_bounce_rate($wpdb, $table, "visit_time BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY) AND DATE_SUB(NOW(), INTERVAL 7 DAY)");
+    if ($bounce_this_week !== null && $bounce_last_week !== null) {
+        $bounce_diff = $bounce_this_week - $bounce_last_week;
+        if (abs($bounce_diff) >= 10) {
+            $richting = $bounce_diff < 0 ? 'daalde' : 'steeg';
+            $highlights[] = "Bouncepercentage $richting met " . abs($bounce_diff) . " procentpunt (nu $bounce_this_week%).";
+        }
+    }
+
+    $tw_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
+    $pw_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY) AND DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
+    $pw_map = array();
+    foreach ($pw_rows as $pw) { $pw_map[$pw->page_url] = (int) $pw->c; }
+    $best_growth = null; $best_growth_page = '';
+    foreach ($tw_rows as $tw) {
+        $cur = (int) $tw->c;
+        if ($cur < 5) continue;
+        $prev = $pw_map[$tw->page_url] ?? 0;
+        if ($prev > 0) {
+            $growth = round((($cur - $prev) / $prev) * 100);
+            if ($growth >= 30 && ($best_growth === null || $growth > $best_growth)) {
+                $best_growth = $growth; $best_growth_page = $tw->page_url;
+            }
+        }
+    }
+    if ($best_growth !== null) {
+        $highlights[] = "Trending: \"$best_growth_page\" groeide met +{$best_growth}% t.o.v. vorige week.";
+    }
+
+    if (!empty($highlights)) {
+        $body .= "\nOpvallend deze week:\n";
+        foreach ($highlights as $h) {
+            $body .= "- $h\n";
+        }
+    }
+
     $body .= "\nBekijk het volledige dashboard: " . admin_url('admin.php?page=brink-analytics') . "\n";
 
     wp_mail($email, 'Je Brink Analytics Rapport', $body);
@@ -1155,29 +1218,8 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     // bounce wanneer er geen volgende pageview van dezelfde bezoeker binnen 30
     // minuten is. Er wordt bewust geen apart session_id-veld toegevoegd (blijft
     // lichtgewicht); dit wordt afgeleid uit de bestaande is_entrance-vlag.
-    $total_sessions = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where");
-    $bounced_sessions = (int) $wpdb->get_var("
-        SELECT COUNT(*) FROM $table e
-        WHERE e.event_type='pageview' AND e.is_entrance=1 AND $where
-        AND NOT EXISTS (
-            SELECT 1 FROM $table p
-            WHERE p.visitor_hash = e.visitor_hash AND p.event_type='pageview' AND p.id != e.id
-            AND p.visit_time > e.visit_time AND p.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
-        )
-    ");
-    $bounce_rate = $total_sessions > 0 ? round(($bounced_sessions / $total_sessions) * 100) : null;
-
-    $prev_total_sessions = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND $prev_where");
-    $prev_bounced_sessions = (int) $wpdb->get_var("
-        SELECT COUNT(*) FROM $table e
-        WHERE e.event_type='pageview' AND e.is_entrance=1 AND $prev_where
-        AND NOT EXISTS (
-            SELECT 1 FROM $table p
-            WHERE p.visitor_hash = e.visitor_hash AND p.event_type='pageview' AND p.id != e.id
-            AND p.visit_time > e.visit_time AND p.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
-        )
-    ");
-    $prev_bounce_rate = $prev_total_sessions > 0 ? round(($prev_bounced_sessions / $prev_total_sessions) * 100) : null;
+    $bounce_rate = wpa_calc_bounce_rate($wpdb, $table, $where);
+    $prev_bounce_rate = wpa_calc_bounce_rate($wpdb, $table, $prev_where);
 
     // Feature #1: gemiddelde tijd op site, benaderd per bezoeker per dag (geen
     // exacte sessieduur, want dat vereist sessie-koppeling die de plugin bewust
@@ -1230,7 +1272,7 @@ function wpa_render_tab_overzicht($wpdb, $table) {
 
     <div class="wpa-grid-4" style="margin-bottom:20px;">
         <div class="wpa-panel">
-            <h3>Live bezoekers</h3>
+            <h3>Live bezoekers<?php echo wpa_tooltip('Aantal unieke bezoekers dat in de afgelopen 5 minuten een pagina bekeek.'); ?></h3>
             <p style="font-size:28px;margin:0;"><?php echo esc_html($live_visitors); ?></p>
             <?php if (!empty($live_countries)): ?>
                 <p style="font-size:12px;color:#888;margin:6px 0 0;">
@@ -1238,14 +1280,14 @@ function wpa_render_tab_overzicht($wpdb, $table) {
                 </p>
             <?php endif; ?>
         </div>
-        <div class="wpa-panel"><h3>Weergaven</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($total_views)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($total_views, $prev_views); ?></div>
-        <div class="wpa-panel"><h3>Unieke bezoekers</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($unique_visitors, $prev_unique_visitors); ?></div>
-        <div class="wpa-panel"><h3>Doelen behaald</h3><p style="font-size:28px;margin:0;"><?php echo esc_html(array_sum($goal_totals)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html(array_sum($goal_totals), array_sum($prev_goal_totals)); ?></div>
+        <div class="wpa-panel"><h3>Weergaven<?php echo wpa_tooltip('Totaal aantal paginaweergaven in de gekozen periode.'); ?></h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($total_views)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($total_views, $prev_views); ?></div>
+        <div class="wpa-panel"><h3>Unieke bezoekers<?php echo wpa_tooltip('Aantal verschillende bezoekers (op basis van de anonieme hash) in de gekozen periode.'); ?></h3><p style="font-size:28px;margin:0;"><?php echo esc_html(number_format_i18n($unique_visitors)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html($unique_visitors, $prev_unique_visitors); ?></div>
+        <div class="wpa-panel"><h3>Doelen behaald<?php echo wpa_tooltip('Aantal unieke bezoekers dat een van de ingestelde conversiedoelen bereikte.'); ?></h3><p style="font-size:28px;margin:0;"><?php echo esc_html(array_sum($goal_totals)); ?></p><?php if ($range !== 'all' && $range !== 'custom') echo wpa_get_trend_html(array_sum($goal_totals), array_sum($prev_goal_totals)); ?></div>
     </div>
 
     <div class="wpa-grid-4" style="margin-bottom:20px;">
         <div class="wpa-panel">
-            <h3>Bouncepercentage</h3>
+            <h3>Bouncepercentage<?php echo wpa_tooltip('Percentage bezoeken waarbij iemand maar 1 pagina bekeek en binnen 30 minuten niet verder klikte. Lager is beter.'); ?></h3>
             <p style="font-size:28px;margin:0;"><?php echo $bounce_rate !== null ? esc_html($bounce_rate) . '%' : 'N/A'; ?></p>
             <?php if ($range !== 'all' && $range !== 'custom' && $bounce_rate !== null && $prev_bounce_rate !== null):
                 $bounce_diff = $bounce_rate - $prev_bounce_rate;
@@ -1258,7 +1300,7 @@ function wpa_render_tab_overzicht($wpdb, $table) {
             <p style="font-size:11px;color:#888;margin:6px 0 0;">% bezoeken met maar 1 pagina</p>
         </div>
         <div class="wpa-panel">
-            <h3>Gem. tijd op site</h3>
+            <h3>Gem. tijd op site<?php echo wpa_tooltip('Benaderde tijd die een bezoeker gemiddeld per dag op de site doorbrengt, opgeteld uit tijd per bekeken pagina.'); ?></h3>
             <p style="font-size:28px;margin:0;"><?php echo esc_html(gmdate('i:s', (int) round($avg_session_seconds))); ?></p>
             <p style="font-size:11px;color:#888;margin:6px 0 0;">Benaderd per bezoeker per dag (geen exacte sessiekoppeling)</p>
         </div>
@@ -1274,6 +1316,40 @@ function wpa_render_tab_overzicht($wpdb, $table) {
         </tbody></table>
     </div>
     <?php endif; ?>
+
+    <div class="wpa-panel" style="margin-bottom:20px;">
+        <h3>Realtime activiteit<?php echo wpa_tooltip('Toont de laatste bezoeken van de afgelopen 15 minuten en ververst elke 15 seconden vanzelf.'); ?></h3>
+        <ul id="wpa-live-feed" style="list-style:none;margin:0;padding:0;max-height:260px;overflow-y:auto;font-size:13px;">
+            <li style="color:#888;padding:6px 0;">Laden...</li>
+        </ul>
+    </div>
+    <script>
+    (function() {
+        const feedEl = document.getElementById('wpa-live-feed');
+        function loadFeed() {
+            const data = new URLSearchParams();
+            data.append('action', 'wpa_live_feed');
+            data.append('nonce', <?php echo wp_json_encode(wp_create_nonce('wpa_live_feed_nonce')); ?>);
+            fetch(ajaxurl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: data.toString() })
+                .then(function(r) { return r.json(); })
+                .then(function(res) {
+                    if (!res.success) return;
+                    if (!res.data.length) {
+                        feedEl.innerHTML = '<li style="color:#888;padding:6px 0;">Geen activiteit in de laatste 15 minuten.</li>';
+                        return;
+                    }
+                    feedEl.innerHTML = res.data.map(function(item) {
+                        return '<li style="padding:6px 0;border-bottom:1px solid #f0f0f1;">' +
+                            '<strong>' + item.time + '</strong> — ' + item.device + ', ' + item.country + ' — ' +
+                            item.page_url + '</li>';
+                    }).join('');
+                })
+                .catch(function() {});
+        }
+        loadFeed();
+        setInterval(loadFeed, 15000);
+    })();
+    </script>
 
     <div class="wpa-panel" style="margin-bottom:20px;">
         <div style="position:relative;height:280px;"><canvas id="wpaChart"></canvas></div>
@@ -1443,6 +1519,38 @@ function wpa_render_tab_kanalen($wpdb, $table) {
     // Exit-pagina's (Feature #9)
     $exit_pages = $wpdb->get_results("SELECT t1.page_url, COUNT(*) as c FROM $table t1 INNER JOIN (SELECT visitor_hash, MAX(visit_time) as last_visit FROM $table WHERE event_type='pageview' GROUP BY visitor_hash) t2 ON t1.visitor_hash = t2.visitor_hash AND t1.visit_time = t2.last_visit WHERE t1.event_type='pageview' GROUP BY t1.page_url ORDER BY c DESC LIMIT 10");
 
+    // Feature #5: bouncepercentage per pagina (top 15 op basis van aantal sessies)
+    $bounce_per_page = $wpdb->get_results("
+        SELECT page_url, COUNT(*) as sessions, SUM(is_bounce) as bounces FROM (
+            SELECT e.id, e.page_url,
+                (NOT EXISTS (
+                    SELECT 1 FROM $table f WHERE f.visitor_hash = e.visitor_hash AND f.event_type='pageview' AND f.id != e.id
+                    AND f.visit_time > e.visit_time AND f.visit_time <= DATE_ADD(e.visit_time, INTERVAL 30 MINUTE)
+                )) as is_bounce
+            FROM $table e WHERE e.event_type='pageview' AND e.is_entrance=1 AND e.visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+        ) t GROUP BY page_url ORDER BY sessions DESC LIMIT 15
+    ");
+
+    // Feature #11: lichte SEO-checklist voor de meest bezochte pagina's (titel-lengte,
+    // meta description van bekende SEO-plugins, uitgelichte afbeelding)
+    $top_pages_for_seo = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY) GROUP BY page_url ORDER BY c DESC LIMIT 5");
+    $seo_checklist = array();
+    foreach ($top_pages_for_seo as $sp) {
+        $post_id = url_to_postid($sp->page_url);
+        if (!$post_id) continue;
+        $title = get_the_title($post_id);
+        $meta_desc = get_post_meta($post_id, '_yoast_wpseo_metadesc', true)
+            ?: get_post_meta($post_id, 'rank_math_description', true)
+            ?: get_post_meta($post_id, '_aioseo_description', true);
+        $seo_checklist[] = array(
+            'page_url' => $sp->page_url,
+            'title_ok' => (bool) $title && mb_strlen($title) <= 60,
+            'title_len' => $title ? mb_strlen($title) : 0,
+            'meta_desc_ok' => !empty($meta_desc),
+            'thumbnail_ok' => has_post_thumbnail($post_id),
+        );
+    }
+
     // 404's en site-zoekopdrachten (Feature #4, #5)
     $not_found = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='404' GROUP BY page_url ORDER BY c DESC LIMIT 10");
     $searches = $wpdb->get_results("SELECT event_name, COUNT(*) as c FROM $table WHERE event_type='site_search' GROUP BY event_name ORDER BY c DESC LIMIT 10");
@@ -1485,7 +1593,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
     }
     ?>
     <div class="wpa-panel" style="margin-bottom:16px;">
-        <h3>Trending content (grootste groei deze week vs. vorige week)</h3>
+        <h3>Trending content (grootste groei deze week vs. vorige week)<?php echo wpa_tooltip('Pagina\'s met minimaal 3 weergaven deze week, gesorteerd op procentuele groei t.o.v. vorige week. Nieuwe pagina\'s staan bovenaan.'); ?></h3>
         <?php if (empty($trending)): ?>
             <p style="color:#666;">Nog niet genoeg data (minimaal 3 weergaven deze week per pagina nodig).</p>
         <?php else: ?>
@@ -1508,7 +1616,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
 
     <div class="wpa-grid-2" style="margin-bottom:16px;">
         <div class="wpa-panel">
-            <h3>Kanaal-groepering (30 dagen)</h3>
+            <h3>Kanaal-groepering (30 dagen)<?php echo wpa_tooltip('Verwijzers automatisch ingedeeld in Organisch (zoekmachines), Social, Betaald (utm_medium=cpc/ppc), Campagne (overige utm_source) of Direct (geen verwijzer).'); ?></h3>
             <table class="widefat"><tbody>
             <?php foreach ($channels as $name => $count): ?>
                 <tr><td><?php echo esc_html($name); ?></td><td><?php echo esc_html($count); ?></td></tr>
@@ -1516,7 +1624,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
             </tbody></table>
         </div>
         <div class="wpa-panel">
-            <h3>Nieuw vs. terugkerend (30 dagen)</h3>
+            <h3>Nieuw vs. terugkerend (30 dagen)<?php echo wpa_tooltip('Nieuw = bezoeker met eerste registratie binnen de afgelopen 30 dagen. Terugkerend = bezoeker die al langer bekend is.'); ?></h3>
             <p>Nieuw: <strong><?php echo esc_html($new_count); ?></strong> &middot; Terugkerend: <strong><?php echo esc_html($returning_count); ?></strong></p>
         </div>
     </div>
@@ -1528,6 +1636,39 @@ function wpa_render_tab_kanalen($wpdb, $table) {
             <tr><td><?php echo esc_html($e->page_url); ?></td><td><?php echo esc_html($e->c); ?></td></tr>
         <?php endforeach; ?>
         </tbody></table>
+    </div>
+
+    <div class="wpa-panel" style="margin-bottom:16px;">
+        <h3>Bouncepercentage per pagina (30 dagen)<?php echo wpa_tooltip('Percentage bezoekers dat via deze pagina binnenkwam en binnen 30 minuten geen andere pagina bekeek.'); ?></h3>
+        <?php if (empty($bounce_per_page)): ?>
+            <p style="color:#666;">Nog geen data.</p>
+        <?php else: ?>
+            <table class="widefat"><thead><tr><th>Pagina</th><th>Sessies</th><th>Bouncepercentage</th></tr></thead><tbody>
+            <?php foreach ($bounce_per_page as $bp):
+                $rate = $bp->sessions > 0 ? round(($bp->bounces / $bp->sessions) * 100) : 0;
+            ?>
+                <tr><td><?php echo esc_html($bp->page_url); ?></td><td><?php echo esc_html($bp->sessions); ?></td><td><?php echo esc_html($rate); ?>%</td></tr>
+            <?php endforeach; ?>
+            </tbody></table>
+        <?php endif; ?>
+    </div>
+
+    <div class="wpa-panel" style="margin-bottom:16px;">
+        <h3>SEO-checklist — top 5 pagina's (30 dagen)<?php echo wpa_tooltip('Snelle check op titel-lengte, meta description (Yoast/RankMath/AIOSEO) en uitgelichte afbeelding. Geen vervanging voor een volwaardige SEO-plugin.'); ?></h3>
+        <?php if (empty($seo_checklist)): ?>
+            <p style="color:#666;">Kon geen pagina's koppelen aan WordPress-content (mogelijk externe of niet-WP-URL's).</p>
+        <?php else: ?>
+            <table class="widefat"><thead><tr><th>Pagina</th><th>Titel (≤60 tekens)</th><th>Meta description</th><th>Uitgelichte afbeelding</th></tr></thead><tbody>
+            <?php foreach ($seo_checklist as $sc): ?>
+                <tr>
+                    <td><?php echo esc_html($sc['page_url']); ?></td>
+                    <td><?php echo $sc['title_ok'] ? '✔' : '✘ (' . esc_html($sc['title_len']) . ' tekens)'; ?></td>
+                    <td><?php echo $sc['meta_desc_ok'] ? '✔' : '✘'; ?></td>
+                    <td><?php echo $sc['thumbnail_ok'] ? '✔' : '✘'; ?></td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody></table>
+        <?php endif; ?>
     </div>
 
     <div class="wpa-grid-2" style="margin-bottom:16px;">
@@ -1624,7 +1765,7 @@ function wpa_render_tab_kanalen($wpdb, $table) {
     <?php endif; ?>
 
     <div class="wpa-panel">
-        <h3>Cohort-retentie (nieuwe bezoekers per week, laatste 8 weken)</h3>
+        <h3>Cohort-retentie (nieuwe bezoekers per week, laatste 8 weken)<?php echo wpa_tooltip('Aantal bezoekers dat voor het eerst is gezien in die week. Een vereenvoudigde weergave, zie toelichting hieronder.'); ?></h3>
         <table class="widefat"><thead><tr><th>Week</th><th>Nieuwe bezoekers</th></tr></thead><tbody>
         <?php foreach ($cohort_rows as $c): ?>
             <tr><td><?php echo esc_html($c->cohort_week); ?></td><td><?php echo esc_html($c->cohort_size); ?></td></tr>
@@ -2078,7 +2219,7 @@ function wpa_render_tab_zoekwoorden($can_manage) {
             <?php elseif (empty($queries)): ?>
                 <p style="color:#666;">Nog geen data beschikbaar.</p>
             <?php else: ?>
-                <table class="widefat"><thead><tr><th>Zoekwoord</th><th>Klikken</th><th>Vertoningen</th><th>CTR</th><th>Positie</th></tr></thead><tbody>
+                <table class="widefat"><thead><tr><th>Zoekwoord</th><th>Klikken</th><th>Vertoningen</th><th>CTR<?php echo wpa_tooltip('Click-through rate: percentage van de vertoningen in Google dat resulteerde in een klik.'); ?></th><th>Positie<?php echo wpa_tooltip('Gemiddelde positie in de zoekresultaten (1 = bovenaan).'); ?></th></tr></thead><tbody>
                 <?php foreach ($queries as $q): ?>
                     <tr>
                         <td><?php echo esc_html($q['keys'][0] ?? ''); ?></td>
@@ -2098,7 +2239,7 @@ function wpa_render_tab_zoekwoorden($can_manage) {
             <?php elseif (empty($pages)): ?>
                 <p style="color:#666;">Nog geen data beschikbaar.</p>
             <?php else: ?>
-                <table class="widefat"><thead><tr><th>Pagina</th><th>Klikken</th><th>Vertoningen</th><th>CTR</th><th>Positie</th></tr></thead><tbody>
+                <table class="widefat"><thead><tr><th>Pagina</th><th>Klikken</th><th>Vertoningen</th><th>CTR<?php echo wpa_tooltip('Click-through rate: percentage van de vertoningen in Google dat resulteerde in een klik.'); ?></th><th>Positie<?php echo wpa_tooltip('Gemiddelde positie in de zoekresultaten (1 = bovenaan).'); ?></th></tr></thead><tbody>
                 <?php foreach ($pages as $p): ?>
                     <tr>
                         <td><?php echo esc_html($p['keys'][0] ?? ''); ?></td>
@@ -2115,4 +2256,32 @@ function wpa_render_tab_zoekwoorden($can_manage) {
     <p style="font-size:12px;color:#888;margin-top:10px;">Gegevens worden 6 uur gecachet en hebben, zoals gebruikelijk bij Search Console, doorgaans 1-2 dagen vertraging.</p>
     <?php endif; ?>
     <?php
+}
+
+// ---------------------------------------------------------------------
+// Feature #15: realtime activiteitenfeed
+// ---------------------------------------------------------------------
+add_action('wp_ajax_wpa_live_feed', 'wpa_ajax_live_feed');
+function wpa_ajax_live_feed() {
+    check_ajax_referer('wpa_live_feed_nonce', 'nonce');
+    if (!current_user_can('view_brink_analytics')) {
+        wp_send_json_error(array('message' => 'Geen toestemming.'), 403);
+    }
+    global $wpdb;
+    $table = $wpdb->prefix . WPA_TABLE_STATS;
+    $rows = $wpdb->get_results("
+        SELECT visit_time, country, device, page_url FROM $table
+        WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+        ORDER BY visit_time DESC LIMIT 20
+    ");
+    $feed = array();
+    foreach ($rows as $r) {
+        $feed[] = array(
+            'time' => date_i18n('H:i:s', strtotime($r->visit_time)),
+            'country' => $r->country ?: 'Onbekend',
+            'device' => $r->device,
+            'page_url' => $r->page_url,
+        );
+    }
+    wp_send_json_success($feed);
 }
