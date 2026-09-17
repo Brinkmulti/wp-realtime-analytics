@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.2.0
+ * Version: 5.3.0
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -17,8 +17,8 @@ define('WPA_TABLE_STATS', 'brink_analytics_stats');
 define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
-define('WPA_DB_VERSION', '5.0.0');
-define('WPA_PLUGIN_VERSION', '5.2.0');
+define('WPA_DB_VERSION', '5.3.0');
+define('WPA_PLUGIN_VERSION', '5.3.0');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -204,11 +204,17 @@ function wpa_create_tables() {
         time_on_page int(11) DEFAULT 0 NOT NULL,
         scroll_depth int(11) DEFAULT 0 NOT NULL,
         is_entrance tinyint(1) DEFAULT 0 NOT NULL,
+        goal_id bigint(20) DEFAULT NULL,
+        funnel_step_id bigint(20) DEFAULT NULL,
         PRIMARY KEY  (id),
         KEY visit_time (visit_time),
         KEY visitor_hash (visitor_hash),
         KEY event_type_time (event_type, visit_time),
-        KEY page_url_event (page_url(191), event_type)
+        KEY page_url_event (page_url(191), event_type),
+        KEY visitor_event_time (visitor_hash, event_type, visit_time),
+        KEY entrance_time (event_type, is_entrance, visit_time),
+        KEY goal_id (goal_id),
+        KEY funnel_step_id (funnel_step_id)
     ) $charset_collate;";
 
     $table_daily = $wpdb->prefix . WPA_TABLE_DAILY;
@@ -293,9 +299,69 @@ add_action('plugins_loaded', 'wpa_maybe_upgrade_db');
 function wpa_maybe_upgrade_db() {
     if (get_option('wpa_db_version') !== WPA_DB_VERSION) {
         wpa_create_tables();
+        wpa_retag_goal_funnel_matches();
+        wpa_force_admin_options_no_autoload();
         update_option('wpa_db_version', WPA_DB_VERSION);
     }
     wpa_get_hash_secret();
+}
+
+// Eenmalige (her)koppeling van bestaande rijen aan doelen/trechterstappen via
+// de oude LIKE-methode — dit is de enige plek waar die kostbare scan nog
+// gebeurt, en dat gebeurt bewust alleen bij een upgrade of wanneer een
+// beheerder de doelen/trechter aanpast, niet bij elke dashboardweergave.
+function wpa_retag_goal_funnel_matches() {
+    global $wpdb;
+    $table = $wpdb->prefix . WPA_TABLE_STATS;
+
+    $wpdb->query("UPDATE $table SET goal_id = NULL");
+    foreach (wpa_get_goals() as $goal) {
+        if (empty($goal->url_pattern)) continue;
+        $wpdb->query($wpdb->prepare(
+            "UPDATE $table SET goal_id = %d WHERE event_type='pageview' AND page_url LIKE %s AND goal_id IS NULL",
+            $goal->id, '%' . $wpdb->esc_like($goal->url_pattern) . '%'
+        ));
+    }
+
+    $wpdb->query("UPDATE $table SET funnel_step_id = NULL");
+    foreach (wpa_get_funnel_steps() as $step) {
+        if (empty($step->url_pattern)) continue;
+        $wpdb->query($wpdb->prepare(
+            "UPDATE $table SET funnel_step_id = %d WHERE event_type='pageview' AND page_url LIKE %s AND funnel_step_id IS NULL",
+            $step->id, '%' . $wpdb->esc_like($step->url_pattern) . '%'
+        ));
+    }
+
+    delete_transient('wpa_kanalen_cache');
+}
+
+// Forceert autoload=no op opties die uitsluitend in wp-admin gebruikt worden,
+// zodat ze niet op elke front-end paginaweergave worden meegeladen. Werkt
+// betrouwbaar op elke ondersteunde WP-versie (5.8+) door delete+add te
+// gebruiken i.p.v. te vertrouwen op update_option()'s autoload-parameter,
+// die pas sinds WP 6.4 consistent bij bestaande opties werkt.
+function wpa_update_option_no_autoload($key, $value) {
+    if (get_option($key) === false) {
+        add_option($key, $value, '', 'no');
+    } else {
+        delete_option($key);
+        add_option($key, $value, '', 'no');
+    }
+}
+
+function wpa_force_admin_options_no_autoload() {
+    $admin_only_keys = array(
+        'wpa_report_email', 'wpa_email_frequency', 'wpa_retention_days_raw', 'wpa_retention_days_summary',
+        'wpa_campaign_costs', 'wpa_dashboard_roles',
+        'wpa_gsc_client_id', 'wpa_gsc_client_secret', 'wpa_gsc_site_url',
+        'wpa_gsc_access_token', 'wpa_gsc_refresh_token', 'wpa_gsc_token_expires',
+    );
+    foreach ($admin_only_keys as $key) {
+        $current = get_option($key, null);
+        if ($current !== null) {
+            wpa_update_option_no_autoload($key, $current);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -332,41 +398,65 @@ function wpa_rest_get_stats($request) {
     ), 200);
 }
 
-// Feature #35: webhook afvuren bij een behaalde conversie
-function wpa_maybe_fire_webhook($url, $visitor_hash) {
+function wpa_get_goals($force_refresh = false) {
+    static $cache = null;
+    if ($cache !== null && !$force_refresh) return $cache;
+    global $wpdb;
+    $table = $wpdb->prefix . WPA_TABLE_GOALS;
+    $cache = $wpdb->get_results("SELECT * FROM $table ORDER BY id ASC");
+    return $cache;
+}
+
+function wpa_get_funnel_steps($force_refresh = false) {
+    static $cache = null;
+    if ($cache !== null && !$force_refresh) return $cache;
+    global $wpdb;
+    $table = $wpdb->prefix . WPA_TABLE_FUNNELS;
+    $cache = $wpdb->get_results("SELECT * FROM $table ORDER BY step_order ASC");
+    return $cache;
+}
+
+// Bepaalt welk doel/trechterstap een URL matcht — wordt bij het wegschrijven
+// van een pageview aangeroepen zodat we het resultaat opslaan (goal_id /
+// funnel_step_id) i.p.v. bij elke dashboardweergave een LIKE '%...%' scan te
+// doen, die geen index kan gebruiken en slecht schaalt naarmate data groeit.
+function wpa_match_goal($url) {
+    foreach (wpa_get_goals() as $goal) {
+        if (!empty($goal->url_pattern) && strpos($url, $goal->url_pattern) !== false) {
+            return $goal;
+        }
+    }
+    return null;
+}
+
+function wpa_match_funnel_step($url) {
+    foreach (wpa_get_funnel_steps() as $step) {
+        if (!empty($step->url_pattern) && strpos($url, $step->url_pattern) !== false) {
+            return $step;
+        }
+    }
+    return null;
+}
+
+// Feature #35: webhook afvuren bij een behaalde conversie (hergebruikt de match
+// die toch al bepaald is bij het opslaan van de pageview, i.p.v. zelf opnieuw te zoeken)
+function wpa_maybe_fire_webhook($url, $visitor_hash, $matched_goal) {
+    if (!$matched_goal) return;
     $webhook_url = get_option('wpa_webhook_url', '');
     if (empty($webhook_url)) return;
 
-    $goals = wpa_get_goals();
-    foreach ($goals as $goal) {
-        if (!empty($goal->url_pattern) && strpos($url, $goal->url_pattern) !== false) {
-            wp_remote_post($webhook_url, array(
-                'timeout' => 3,
-                'blocking' => false,
-                'headers' => array('Content-Type' => 'application/json'),
-                'body' => wp_json_encode(array(
-                    'event' => 'conversion',
-                    'goal' => $goal->name,
-                    'page_url' => $url,
-                    'visitor_hash' => $visitor_hash,
-                    'site' => home_url(),
-                )),
-            ));
-            break;
-        }
-    }
-}
-
-function wpa_get_goals() {
-    global $wpdb;
-    $table = $wpdb->prefix . WPA_TABLE_GOALS;
-    return $wpdb->get_results("SELECT * FROM $table ORDER BY id ASC");
-}
-
-function wpa_get_funnel_steps() {
-    global $wpdb;
-    $table = $wpdb->prefix . WPA_TABLE_FUNNELS;
-    return $wpdb->get_results("SELECT * FROM $table ORDER BY step_order ASC");
+    wp_remote_post($webhook_url, array(
+        'timeout' => 3,
+        'blocking' => false,
+        'headers' => array('Content-Type' => 'application/json'),
+        'body' => wp_json_encode(array(
+            'event' => 'conversion',
+            'goal' => $matched_goal->name,
+            'page_url' => $url,
+            'visitor_hash' => $visitor_hash,
+            'site' => home_url(),
+        )),
+    ));
 }
 
 function wpa_rest_track_visit($request) {
@@ -448,9 +538,13 @@ function wpa_rest_track_visit($request) {
     $utm_campaign = isset($params['utm_campaign']) ? sanitize_text_field($params['utm_campaign']) : '';
 
     $is_entrance = 0;
+    $matched_goal = null;
+    $matched_step = null;
     if ($event_type === 'pageview') {
         $existing = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table WHERE visitor_hash = %s AND visit_time >= %s LIMIT 1", $hash, date('Y-m-d H:i:s', current_time('timestamp') - 1800)));
         $is_entrance = $existing ? 0 : 1;
+        $matched_goal = wpa_match_goal($url);
+        $matched_step = wpa_match_funnel_step($url);
     }
 
     $wpdb->insert($table, array(
@@ -471,10 +565,12 @@ function wpa_rest_track_visit($request) {
         'time_on_page' => $time_on_page,
         'scroll_depth' => $scroll_depth,
         'is_entrance' => $is_entrance,
+        'goal_id' => $matched_goal ? $matched_goal->id : null,
+        'funnel_step_id' => $matched_step ? $matched_step->id : null,
     ));
 
     if ($event_type === 'pageview') {
-        wpa_maybe_fire_webhook($url, $hash);
+        wpa_maybe_fire_webhook($url, $hash, $matched_goal);
     }
 
     return new WP_REST_Response(array('success' => true), 200);
@@ -904,6 +1000,8 @@ function wpa_run_daily_cleanup() {
             $summary_retention
         ));
     }
+
+    delete_transient('wpa_kanalen_cache');
 }
 
 // Feature #29: afwijkingsmeldingen bij een plotselinge piek of dip
@@ -998,7 +1096,6 @@ function wpa_handle_settings_export() {
         isset($_GET['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['_wpnonce'])), 'wpa_export_settings')
     ) {
         $settings = array(
-            'wpa_goal_url' => get_option('wpa_goal_url'),
             'wpa_report_email' => get_option('wpa_report_email'),
             'wpa_exclude_roles' => get_option('wpa_exclude_roles', array()),
             'wpa_exclude_ips' => get_option('wpa_exclude_ips', array()),
@@ -1037,12 +1134,12 @@ function wpa_render_dashboard() {
         if (!isset($_POST['wpa_settings_nonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['wpa_settings_nonce'])), 'wpa_save_settings_action')) {
             wp_die(esc_html__('Beveiligingscontrole mislukt. Ververs de pagina en probeer het opnieuw.', 'brink-analytics'));
         }
-        update_option('wpa_report_email', sanitize_email(wp_unslash($_POST['wpa_report_email'])));
+        wpa_update_option_no_autoload('wpa_report_email', sanitize_email(wp_unslash($_POST['wpa_report_email'])));
         update_option('wpa_webhook_url', esc_url_raw(wp_unslash($_POST['wpa_webhook_url'] ?? '')));
-        update_option('wpa_email_frequency', in_array($_POST['wpa_email_frequency'] ?? '', array('daily','weekly','monthly','never'), true) ? sanitize_key($_POST['wpa_email_frequency']) : 'weekly');
+        wpa_update_option_no_autoload('wpa_email_frequency', in_array($_POST['wpa_email_frequency'] ?? '', array('daily','weekly','monthly','never'), true) ? sanitize_key($_POST['wpa_email_frequency']) : 'weekly');
         update_option('wpa_anonymize_ip', isset($_POST['wpa_anonymize_ip']));
-        update_option('wpa_retention_days_raw', max(30, absint($_POST['wpa_retention_days_raw'] ?? 90)));
-        update_option('wpa_retention_days_summary', max(0, absint($_POST['wpa_retention_days_summary'] ?? 730)));
+        wpa_update_option_no_autoload('wpa_retention_days_raw', max(30, absint($_POST['wpa_retention_days_raw'] ?? 90)));
+        wpa_update_option_no_autoload('wpa_retention_days_summary', max(0, absint($_POST['wpa_retention_days_summary'] ?? 730)));
         update_option('wpa_enable_heatmap', isset($_POST['wpa_enable_heatmap']));
         update_option('wpa_enable_form_tracking', isset($_POST['wpa_enable_form_tracking']));
         update_option('wpa_enable_video_tracking', isset($_POST['wpa_enable_video_tracking']));
@@ -1066,7 +1163,7 @@ function wpa_render_dashboard() {
             if (in_array($role_slug, $posted_dashboard_roles, true)) { $role_obj->add_cap('view_brink_analytics'); }
             else { $role_obj->remove_cap('view_brink_analytics'); }
         }
-        update_option('wpa_dashboard_roles', $posted_dashboard_roles);
+        wpa_update_option_no_autoload('wpa_dashboard_roles', $posted_dashboard_roles);
 
         // Feature #16: ROI-kosten per UTM-campagne
         $costs = array();
@@ -1077,7 +1174,7 @@ function wpa_render_dashboard() {
                 if ($cname !== '') $costs[$cname] = $cost;
             }
         }
-        update_option('wpa_campaign_costs', $costs);
+        wpa_update_option_no_autoload('wpa_campaign_costs', $costs);
 
         echo '<div class="updated"><p>Instellingen opgeslagen.</p></div>';
     }
@@ -1096,6 +1193,8 @@ function wpa_render_dashboard() {
             }
         }
         echo '<div class="updated"><p>Doelen opgeslagen.</p></div>';
+        wpa_get_goals(true);
+        wpa_retag_goal_funnel_matches();
     }
 
     // --- Trechter (Feature #12) opslaan ---
@@ -1112,6 +1211,8 @@ function wpa_render_dashboard() {
             }
         }
         echo '<div class="updated"><p>Trechter opgeslagen.</p></div>';
+        wpa_get_funnel_steps(true);
+        wpa_retag_goal_funnel_matches();
     }
 
     // --- Instellingen importeren (Feature #31) ---
@@ -1120,7 +1221,7 @@ function wpa_render_dashboard() {
             $json = file_get_contents($_FILES['wpa_import_file']['tmp_name']);
             $data = json_decode($json, true);
             if (is_array($data)) {
-                $allowed_keys = array('wpa_goal_url','wpa_report_email','wpa_exclude_roles','wpa_exclude_ips','wpa_dashboard_roles','wpa_anonymize_ip','wpa_retention_days_raw','wpa_retention_days_summary','wpa_email_frequency','wpa_webhook_url','wpa_enable_heatmap','wpa_enable_form_tracking','wpa_enable_video_tracking','wpa_enable_web_vitals','wpa_campaign_costs');
+                $allowed_keys = array('wpa_report_email','wpa_exclude_roles','wpa_exclude_ips','wpa_dashboard_roles','wpa_anonymize_ip','wpa_retention_days_raw','wpa_retention_days_summary','wpa_email_frequency','wpa_webhook_url','wpa_enable_heatmap','wpa_enable_form_tracking','wpa_enable_video_tracking','wpa_enable_web_vitals','wpa_campaign_costs');
                 foreach ($allowed_keys as $key) {
                     if (array_key_exists($key, $data)) {
                         update_option($key, $data[$key]);
@@ -1248,8 +1349,8 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     $goal_totals = array();
     $prev_goal_totals = array();
     foreach ($goals as $goal) {
-        $goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $where AND page_url LIKE %s", '%' . $wpdb->esc_like($goal->url_pattern) . '%'));
-        $prev_goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $prev_where AND page_url LIKE %s", '%' . $wpdb->esc_like($goal->url_pattern) . '%'));
+        $goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $where AND goal_id = %d", $goal->id));
+        $prev_goal_totals[$goal->name] = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE $prev_where AND goal_id = %d", $goal->id));
     }
     ?>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap;">
@@ -1326,6 +1427,45 @@ function wpa_render_tab_overzicht($wpdb, $table) {
     <script>
     (function() {
         const feedEl = document.getElementById('wpa-live-feed');
+
+        function clearFeed() {
+            while (feedEl.firstChild) feedEl.removeChild(feedEl.firstChild);
+        }
+
+        function renderEmptyMessage(text) {
+            clearFeed();
+            const li = document.createElement('li');
+            li.style.color = '#888';
+            li.style.padding = '6px 0';
+            li.textContent = text;
+            feedEl.appendChild(li);
+        }
+
+        // Bouwt de lijst met veilige DOM-methodes (textContent) i.p.v. innerHTML
+        // string-concatenatie: page_url en country komen uiteindelijk van
+        // (mogelijk kwaadwillende) bezoekers via het publieke track-endpoint,
+        // dus die tekst mag nooit als HTML geïnterpreteerd worden.
+        function renderFeed(items) {
+            clearFeed();
+            items.forEach(function(item) {
+                const li = document.createElement('li');
+                li.style.padding = '6px 0';
+                li.style.borderBottom = '1px solid #f0f0f1';
+
+                const strong = document.createElement('strong');
+                strong.textContent = item.time;
+                li.appendChild(strong);
+
+                li.appendChild(document.createTextNode(' — ' + item.device + ', ' + item.country + ' — '));
+
+                const urlSpan = document.createElement('span');
+                urlSpan.textContent = item.page_url;
+                li.appendChild(urlSpan);
+
+                feedEl.appendChild(li);
+            });
+        }
+
         function loadFeed() {
             const data = new URLSearchParams();
             data.append('action', 'wpa_live_feed');
@@ -1335,19 +1475,25 @@ function wpa_render_tab_overzicht($wpdb, $table) {
                 .then(function(res) {
                     if (!res.success) return;
                     if (!res.data.length) {
-                        feedEl.innerHTML = '<li style="color:#888;padding:6px 0;">Geen activiteit in de laatste 15 minuten.</li>';
+                        renderEmptyMessage('Geen activiteit in de laatste 15 minuten.');
                         return;
                     }
-                    feedEl.innerHTML = res.data.map(function(item) {
-                        return '<li style="padding:6px 0;border-bottom:1px solid #f0f0f1;">' +
-                            '<strong>' + item.time + '</strong> — ' + item.device + ', ' + item.country + ' — ' +
-                            item.page_url + '</li>';
-                    }).join('');
+                    renderFeed(res.data);
                 })
                 .catch(function() {});
         }
         loadFeed();
-        setInterval(loadFeed, 15000);
+        // Stop met verversen zodra het tabblad niet zichtbaar is (bv. op de
+        // achtergrond openstaand), zodat dit geen onnodige queries blijft doen.
+        let intervalId = setInterval(loadFeed, 15000);
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'hidden') {
+                clearInterval(intervalId);
+            } else {
+                loadFeed();
+                intervalId = setInterval(loadFeed, 15000);
+            }
+        });
     })();
     </script>
 
@@ -1435,7 +1581,7 @@ function wpa_render_tab_trechter($wpdb, $table, $can_manage) {
         <?php if (!empty($steps)):
             $prev_count = null;
             foreach ($steps as $step):
-                $count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE page_url LIKE %s AND event_type='pageview'", '%' . $wpdb->esc_like($step->url_pattern) . '%'));
+                $count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE funnel_step_id = %d AND event_type='pageview'", $step->id));
                 $pct = ($prev_count && $prev_count > 0) ? round(($count / $prev_count) * 100) : 100;
                 $width = $prev_count ? max(5, $pct) : 100;
         ?>
@@ -1481,8 +1627,12 @@ function wpa_render_tab_trechter($wpdb, $table, $can_manage) {
     <?php
 }
 
-function wpa_render_tab_kanalen($wpdb, $table) {
-    $rows = $wpdb->get_results("SELECT referrer, utm_source, utm_medium, visitor_hash FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+// Alle berekeningen voor deze tab worden 30 minuten gecachet (transient),
+// want dit tabblad deed voorheen 15+ ongecachte queries per paginalaad —
+// onnodig zwaar voor data die toch niet live hoeft te zijn (in tegenstelling
+// tot de Live-teller en de Realtime activiteitenfeed elders in het dashboard).
+function wpa_compute_kanalen_data($wpdb, $table) {
+    $rows = $wpdb->get_results("SELECT referrer, utm_source, utm_medium FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
     $channels = array();
     foreach ($rows as $r) {
         $ch = wpa_get_channel($r->referrer, $r->utm_source, $r->utm_medium);
@@ -1585,12 +1735,29 @@ function wpa_render_tab_kanalen($wpdb, $table) {
     $campaign_conversions = array();
     if (!empty($campaign_costs)) {
         $goals = wpa_get_goals();
-        $goal_pattern = !empty($goals) ? $goals[0]->url_pattern : '';
+        $first_goal_id = !empty($goals) ? $goals[0]->id : 0;
         foreach ($campaign_costs as $cname => $cost) {
-            $conv = $goal_pattern ? (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE utm_campaign = %s AND page_url LIKE %s", $cname, '%' . $wpdb->esc_like($goal_pattern) . '%')) : 0;
+            $conv = $first_goal_id ? (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE utm_campaign = %s AND goal_id = %d", $cname, $first_goal_id)) : 0;
             $campaign_conversions[$cname] = array('cost' => $cost, 'conversions' => $conv, 'cpc' => $conv > 0 ? round($cost / $conv, 2) : null);
         }
     }
+
+    return compact(
+        'channels', 'trending', 'new_count', 'returning_count', 'exit_pages',
+        'bounce_per_page', 'seo_checklist', 'not_found', 'searches', 'form_exits',
+        'video_progress', 'ab_variants', 'vitals_raw', 'top_page_for_heatmap',
+        'heatmap_grid', 'max_heat', 'cohort_rows', 'campaign_conversions'
+    );
+}
+
+function wpa_render_tab_kanalen($wpdb, $table) {
+    $cache_key = 'wpa_kanalen_cache';
+    $data = get_transient($cache_key);
+    if (false === $data) {
+        $data = wpa_compute_kanalen_data($wpdb, $table);
+        set_transient($cache_key, $data, 30 * MINUTE_IN_SECONDS);
+    }
+    extract($data);
     ?>
     <div class="wpa-panel" style="margin-bottom:16px;">
         <h3>Trending content (grootste groei deze week vs. vorige week)<?php echo wpa_tooltip('Pagina\'s met minimaal 3 weergaven deze week, gesorteerd op procentuele groei t.o.v. vorige week. Nieuwe pagina\'s staan bovenaan.'); ?></h3>
@@ -2062,11 +2229,11 @@ function wpa_handle_gsc_oauth_callback() {
 
     $data = json_decode(wp_remote_retrieve_body($response), true);
     if (!empty($data['access_token'])) {
-        update_option('wpa_gsc_access_token', $data['access_token']);
+        wpa_update_option_no_autoload('wpa_gsc_access_token', $data['access_token']);
         if (!empty($data['refresh_token'])) {
-            update_option('wpa_gsc_refresh_token', $data['refresh_token']);
+            wpa_update_option_no_autoload('wpa_gsc_refresh_token', $data['refresh_token']);
         }
-        update_option('wpa_gsc_token_expires', time() + (int) ($data['expires_in'] ?? 3600));
+        wpa_update_option_no_autoload('wpa_gsc_token_expires', time() + (int) ($data['expires_in'] ?? 3600));
         wp_safe_redirect(wpa_gsc_redirect_uri());
         exit;
     } else {
@@ -2109,6 +2276,9 @@ function wpa_gsc_get_valid_access_token() {
         return false;
     }
 
+    // Gewone update_option() volstaat hier (geen delete+add nodig): het option-record
+    // bestaat al met autoload=no (gezet bij de eerste koppeling), en een gewone
+    // update_option() op een bestaande optie verandert de autoload-vlag niet.
     update_option('wpa_gsc_access_token', $data['access_token']);
     update_option('wpa_gsc_token_expires', time() + (int) ($data['expires_in'] ?? 3600));
     return $data['access_token'];
@@ -2151,9 +2321,9 @@ function wpa_gsc_fetch_search_analytics($dimension, $days = 28) {
 
 function wpa_render_tab_zoekwoorden($can_manage) {
     if ($can_manage && isset($_POST['wpa_save_gsc']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['wpa_gsc_nonce'] ?? '')), 'wpa_save_gsc_action')) {
-        update_option('wpa_gsc_client_id', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_id'] ?? '')));
-        update_option('wpa_gsc_client_secret', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_secret'] ?? '')));
-        update_option('wpa_gsc_site_url', esc_url_raw(wp_unslash($_POST['wpa_gsc_site_url'] ?? home_url('/'))));
+        wpa_update_option_no_autoload('wpa_gsc_client_id', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_id'] ?? '')));
+        wpa_update_option_no_autoload('wpa_gsc_client_secret', sanitize_text_field(wp_unslash($_POST['wpa_gsc_client_secret'] ?? '')));
+        wpa_update_option_no_autoload('wpa_gsc_site_url', esc_url_raw(wp_unslash($_POST['wpa_gsc_site_url'] ?? home_url('/'))));
         echo '<div class="updated"><p>Search Console-instellingen opgeslagen.</p></div>';
     }
 
