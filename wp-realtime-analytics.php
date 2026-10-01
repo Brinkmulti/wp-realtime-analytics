@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.3.0
+ * Version: 5.4.0
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.3.0');
-define('WPA_PLUGIN_VERSION', '5.3.0');
+define('WPA_PLUGIN_VERSION', '5.4.0');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -264,7 +264,7 @@ function wpa_activate_plugin() {
         wp_schedule_event(time(), 'daily', 'wpa_daily_cleanup_event');
     }
     if (!wp_next_scheduled('wpa_weekly_email_event')) {
-        wp_schedule_event(time(), 'weekly', 'wpa_weekly_email_event');
+        wp_schedule_event(time(), 'daily', 'wpa_weekly_email_event');
     }
     // Feature #29: dagelijkse controle op afwijkend verkeer
     if (!wp_next_scheduled('wpa_anomaly_check_event')) {
@@ -301,6 +301,17 @@ function wpa_maybe_upgrade_db() {
         wpa_create_tables();
         wpa_retag_goal_funnel_matches();
         wpa_force_admin_options_no_autoload();
+
+        // De rapportage-cron liep tot v5.3.x altijd wekelijks, ongeacht de
+        // gekozen frequentie-instelling — hierdoor kon "dagelijks" nooit vaker
+        // dan wekelijks daadwerkelijk versturen. Op bestaande sites plannen we
+        // 'm hier opnieuw in als dagelijkse tik.
+        $next = wp_next_scheduled('wpa_weekly_email_event');
+        if ($next && wp_get_schedule('wpa_weekly_email_event') !== 'daily') {
+            wp_unschedule_event($next, 'wpa_weekly_email_event');
+            wp_schedule_event(time(), 'daily', 'wpa_weekly_email_event');
+        }
+
         update_option('wpa_db_version', WPA_DB_VERSION);
     }
     wpa_get_hash_secret();
@@ -891,44 +902,68 @@ function wpa_tooltip($text) {
 }
 
 function wpa_send_weekly_email() {
-    // Feature #28: e-mailfrequentie instelbaar; deze cron is de vaste "klok",
-    // maar we versturen alleen daadwerkelijk als de frequentie dat toestaat.
-    $frequency = get_option('wpa_email_frequency', 'weekly');
+    // Feature #28: e-mailfrequentie instelbaar. De cron zelf draait nu dagelijks
+    // (zie wpa_activate_plugin) en deze functie bepaalt aan de hand van de
+    // instelling of er daadwerkelijk verstuurd wordt — zo werkt "dagelijks"
+    // ook echt dagelijks, i.p.v. hooguit wekelijks doordat de onderliggende
+    // cron maar één keer per week tikte.
+    $frequency = get_option('wpa_email_frequency', 'monthly');
     if ($frequency === 'never') return;
-    if ($frequency === 'daily' && get_transient('wpa_last_email_sent')) return;
+    if ($frequency === 'weekly' && get_transient('wpa_last_email_sent_weekly')) return;
     if ($frequency === 'monthly' && (int) date('j') !== 1) return;
 
     global $wpdb;
     $email = get_option('wpa_report_email', '');
     if (empty($email)) return;
 
-    $table = $wpdb->prefix . WPA_TABLE_STATS;
-    $views = (int) $wpdb->get_var("SELECT COUNT(*) FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND event_type='pageview'");
-    $visitors = (int) $wpdb->get_var("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND event_type='pageview'");
-    $top_page = $wpdb->get_var("SELECT page_url FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND event_type='pageview' GROUP BY page_url ORDER BY COUNT(*) DESC LIMIT 1");
-
-    $body  = "Hoi,\n\nHier is je samenvatting van Brink Multimedia Analytics:\n\n";
-    $body .= "- Weergaven afgelopen 7 dagen: " . number_format_i18n($views) . "\n";
-    $body .= "- Unieke bezoekers afgelopen 7 dagen: " . number_format_i18n($visitors) . "\n";
-    if ($top_page) {
-        $body .= "- Meest bezochte pagina: " . $top_page . "\n";
+    // De periode waarover gerapporteerd wordt sluit aan op de gekozen frequentie
+    if ($frequency === 'daily') {
+        $period_days = 1; $period_label = 'afgelopen dag';
+    } elseif ($frequency === 'monthly') {
+        $period_days = 30; $period_label = 'afgelopen maand';
+    } else {
+        $period_days = 7; $period_label = 'afgelopen 7 dagen';
     }
 
-    // Feature #2: automatisch gegenereerde highlights
-    $highlights = array();
+    $table = $wpdb->prefix . WPA_TABLE_STATS;
+    $views = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL %d DAY) AND event_type='pageview'", $period_days));
+    $visitors = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_hash) FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL %d DAY) AND event_type='pageview'", $period_days));
+    $top_pages = $wpdb->get_results($wpdb->prepare("SELECT page_url, COUNT(*) as c FROM $table WHERE visit_time >= DATE_SUB(NOW(), INTERVAL %d DAY) AND event_type='pageview' GROUP BY page_url ORDER BY c DESC LIMIT 5", $period_days));
 
-    $bounce_this_week = wpa_calc_bounce_rate($wpdb, $table, "visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)");
-    $bounce_last_week = wpa_calc_bounce_rate($wpdb, $table, "visit_time BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY) AND DATE_SUB(NOW(), INTERVAL 7 DAY)");
-    if ($bounce_this_week !== null && $bounce_last_week !== null) {
-        $bounce_diff = $bounce_this_week - $bounce_last_week;
-        if (abs($bounce_diff) >= 10) {
-            $richting = $bounce_diff < 0 ? 'daalde' : 'steeg';
-            $highlights[] = "Bouncepercentage $richting met " . abs($bounce_diff) . " procentpunt (nu $bounce_this_week%).";
+    $site_name = get_bloginfo('name');
+    $site_url = home_url('/');
+
+    $body  = "Hoi,\n\nHier is je samenvatting van Brink Multimedia Analytics voor $site_name ($site_url):\n\n";
+    $body .= "- Weergaven $period_label: " . number_format_i18n($views) . "\n";
+    $body .= "- Unieke bezoekers $period_label: " . number_format_i18n($visitors) . "\n";
+
+    if (!empty($top_pages)) {
+        $body .= "\nTop 5 best presterende pagina's:\n";
+        $rank = 1;
+        foreach ($top_pages as $tp) {
+            $body .= "$rank. $tp->page_url — " . number_format_i18n((int) $tp->c) . " weergaven\n";
+            $rank++;
         }
     }
 
-    $tw_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
-    $pw_rows = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY) AND DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY page_url");
+    // Feature #2: automatisch gegenereerde highlights (vergelijkt met de voorgaande,
+    // even lange periode)
+    $highlights = array();
+    $prev_period_where = $wpdb->prepare("visit_time BETWEEN DATE_SUB(NOW(), INTERVAL %d DAY) AND DATE_SUB(NOW(), INTERVAL %d DAY)", $period_days * 2, $period_days);
+    $cur_period_where = $wpdb->prepare("visit_time >= DATE_SUB(NOW(), INTERVAL %d DAY)", $period_days);
+
+    $bounce_this_period = wpa_calc_bounce_rate($wpdb, $table, $cur_period_where);
+    $bounce_prev_period = wpa_calc_bounce_rate($wpdb, $table, $prev_period_where);
+    if ($bounce_this_period !== null && $bounce_prev_period !== null) {
+        $bounce_diff = $bounce_this_period - $bounce_prev_period;
+        if (abs($bounce_diff) >= 10) {
+            $richting = $bounce_diff < 0 ? 'daalde' : 'steeg';
+            $highlights[] = "Bouncepercentage $richting met " . abs($bounce_diff) . " procentpunt (nu $bounce_this_period%).";
+        }
+    }
+
+    $tw_rows = $wpdb->get_results($wpdb->prepare("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time >= DATE_SUB(NOW(), INTERVAL %d DAY) GROUP BY page_url", $period_days));
+    $pw_rows = $wpdb->get_results($wpdb->prepare("SELECT page_url, COUNT(*) as c FROM $table WHERE event_type='pageview' AND visit_time BETWEEN DATE_SUB(NOW(), INTERVAL %d DAY) AND DATE_SUB(NOW(), INTERVAL %d DAY) GROUP BY page_url", $period_days * 2, $period_days));
     $pw_map = array();
     foreach ($pw_rows as $pw) { $pw_map[$pw->page_url] = (int) $pw->c; }
     $best_growth = null; $best_growth_page = '';
@@ -944,11 +979,11 @@ function wpa_send_weekly_email() {
         }
     }
     if ($best_growth !== null) {
-        $highlights[] = "Trending: \"$best_growth_page\" groeide met +{$best_growth}% t.o.v. vorige week.";
+        $highlights[] = "Trending: \"$best_growth_page\" groeide met +{$best_growth}% t.o.v. de periode ervoor.";
     }
 
     if (!empty($highlights)) {
-        $body .= "\nOpvallend deze week:\n";
+        $body .= "\nOpvallend:\n";
         foreach ($highlights as $h) {
             $body .= "- $h\n";
         }
@@ -956,8 +991,10 @@ function wpa_send_weekly_email() {
 
     $body .= "\nBekijk het volledige dashboard: " . admin_url('admin.php?page=brink-analytics') . "\n";
 
-    wp_mail($email, 'Je Brink Analytics Rapport', $body);
-    set_transient('wpa_last_email_sent', 1, DAY_IN_SECONDS - 60);
+    wp_mail($email, "Brink Analytics rapport — $site_name", $body);
+    if ($frequency === 'weekly') {
+        set_transient('wpa_last_email_sent_weekly', 1, 7 * DAY_IN_SECONDS - HOUR_IN_SECONDS);
+    }
 }
 
 add_action('wpa_daily_cleanup_event', 'wpa_run_daily_cleanup');
@@ -1103,7 +1140,7 @@ function wpa_handle_settings_export() {
             'wpa_anonymize_ip' => get_option('wpa_anonymize_ip', true),
             'wpa_retention_days_raw' => get_option('wpa_retention_days_raw', 90),
             'wpa_retention_days_summary' => get_option('wpa_retention_days_summary', 730),
-            'wpa_email_frequency' => get_option('wpa_email_frequency', 'weekly'),
+            'wpa_email_frequency' => get_option('wpa_email_frequency', 'monthly'),
             'wpa_webhook_url' => get_option('wpa_webhook_url', ''),
             'wpa_enable_heatmap' => get_option('wpa_enable_heatmap', false),
             'wpa_enable_form_tracking' => get_option('wpa_enable_form_tracking', false),
@@ -1136,7 +1173,7 @@ function wpa_render_dashboard() {
         }
         wpa_update_option_no_autoload('wpa_report_email', sanitize_email(wp_unslash($_POST['wpa_report_email'])));
         update_option('wpa_webhook_url', esc_url_raw(wp_unslash($_POST['wpa_webhook_url'] ?? '')));
-        wpa_update_option_no_autoload('wpa_email_frequency', in_array($_POST['wpa_email_frequency'] ?? '', array('daily','weekly','monthly','never'), true) ? sanitize_key($_POST['wpa_email_frequency']) : 'weekly');
+        wpa_update_option_no_autoload('wpa_email_frequency', in_array($_POST['wpa_email_frequency'] ?? '', array('daily','weekly','monthly','never'), true) ? sanitize_key($_POST['wpa_email_frequency']) : 'monthly');
         update_option('wpa_anonymize_ip', isset($_POST['wpa_anonymize_ip']));
         wpa_update_option_no_autoload('wpa_retention_days_raw', max(30, absint($_POST['wpa_retention_days_raw'] ?? 90)));
         wpa_update_option_no_autoload('wpa_retention_days_summary', max(0, absint($_POST['wpa_retention_days_summary'] ?? 730)));
@@ -1998,7 +2035,7 @@ function wpa_render_tab_privacy($can_manage) {
 function wpa_render_tab_instellingen($can_manage) {
     $report_email = get_option('wpa_report_email', get_option('admin_email'));
     $webhook_url = get_option('wpa_webhook_url', '');
-    $email_frequency = get_option('wpa_email_frequency', 'weekly');
+    $email_frequency = get_option('wpa_email_frequency', 'monthly');
     $retention_raw = get_option('wpa_retention_days_raw', 90);
     $retention_summary = get_option('wpa_retention_days_summary', 730);
     $enable_heatmap = get_option('wpa_enable_heatmap', false);
