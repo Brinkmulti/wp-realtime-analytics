@@ -3,7 +3,7 @@
  * Plugin Name: Brink Multimedia Analytics
  * Plugin URI: https://www.brink-multimedia.nl
  * Description: Real-time, privacy-vriendelijke statistieken en marketing dashboard voor WordPress.
- * Version: 5.4.0
+ * Version: 5.4.1
  * Author: Brink Multimedia
  * Author URI: https://www.brink-multimedia.nl
  * Requires at least: 5.8
@@ -18,7 +18,7 @@ define('WPA_TABLE_DAILY', 'brink_analytics_daily_summary');
 define('WPA_TABLE_GOALS', 'brink_analytics_goals');
 define('WPA_TABLE_FUNNELS', 'brink_analytics_funnel_steps');
 define('WPA_DB_VERSION', '5.3.0');
-define('WPA_PLUGIN_VERSION', '5.4.0');
+define('WPA_PLUGIN_VERSION', '5.4.1');
 
 // ---------------------------------------------------------------------
 // GitHub Auto-Updater (lichtgewicht, geen externe library)
@@ -990,6 +990,7 @@ function wpa_send_weekly_email() {
     }
 
     $body .= "\nBekijk het volledige dashboard: " . admin_url('admin.php?page=brink-analytics') . "\n";
+    $body .= "\n--\nBrink Multimedia Analytics v" . WPA_PLUGIN_VERSION;
 
     wp_mail($email, "Brink Analytics rapport — $site_name", $body);
     if ($frequency === 'weekly') {
@@ -1057,14 +1058,32 @@ function wpa_run_anomaly_check() {
     $deviation = (($yesterday - $avg_7d) / $avg_7d) * 100;
     if (abs($deviation) < 50) return;
 
-    $richting = $deviation > 0 ? 'piek' : 'daling';
-    $body = "Brink Analytics signaleert een ongebruikelijke $richting in het verkeer.\n\n";
+    $site_name = get_bloginfo('name');
+    $site_url = home_url('/');
+    $richting = $deviation > 0 ? 'piek (toename)' : 'daling (afname)';
+    $deviation_sign = $deviation > 0 ? '+' : ''; // round() behoudt het minteken bij een daling zelf al
+
+    $top_pages = $wpdb->get_results("SELECT page_url, COUNT(*) as c FROM $table WHERE DATE(visit_time) = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND event_type='pageview' GROUP BY page_url ORDER BY c DESC LIMIT 10");
+
+    $body  = "Statistieken van $site_name ($site_url)\n\n";
+    $body .= "Brink Analytics signaleert een ongebruikelijke $richting in het verkeer.\n\n";
     $body .= "Gisteren: " . number_format_i18n($yesterday) . " weergaven\n";
     $body .= "Gemiddeld (7 dagen ervoor): " . number_format_i18n(round($avg_7d)) . " weergaven\n";
-    $body .= "Afwijking: " . round($deviation) . "%\n\n";
-    $body .= "Bekijk het dashboard: " . admin_url('admin.php?page=brink-analytics');
+    $body .= "Afwijking: {$deviation_sign}" . round($deviation) . "% ten opzichte van het gemiddelde — dit is dus een $richting.\n";
 
-    wp_mail($email, "Brink Analytics: ongebruikelijke $richting in verkeer", $body);
+    if (!empty($top_pages)) {
+        $body .= "\nTop 10 meest bezochte pagina's gisteren:\n";
+        $rank = 1;
+        foreach ($top_pages as $tp) {
+            $body .= "$rank. $tp->page_url — " . number_format_i18n((int) $tp->c) . " weergaven\n";
+            $rank++;
+        }
+    }
+
+    $body .= "\nBekijk het dashboard: " . admin_url('admin.php?page=brink-analytics') . "\n";
+    $body .= "\n--\nBrink Multimedia Analytics v" . WPA_PLUGIN_VERSION;
+
+    wp_mail($email, "Brink Analytics ($site_name): ongebruikelijke $richting in verkeer", $body);
 }
 
 // ---------------------------------------------------------------------
